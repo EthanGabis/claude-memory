@@ -1,0 +1,19 @@
+{
+  "name": "claude-memory",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun mcp/server.ts",
+    "migrate": "bun migrate/extract.ts && bun migrate/write-logs.ts && bun migrate/generate-memory.ts",
+    "install-plugin": "bash scripts/install.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "openai": "^4.47.0",
+    "tiktoken": "^1.0.15"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}
