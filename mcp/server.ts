@@ -10,9 +10,11 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 
 import { initDb, DB_PATH } from './schema.js';
-import { embedText } from './embeddings.js';
+import { packEmbedding } from './embeddings.js';
 import { search, type SearchResult } from './search.js';
-import { indexFile } from './indexer.js';
+import { indexFile, backfillEmbeddings } from './indexer.js';
+import { createProviderChain } from './providers.js';
+import { startWatcher } from './watcher.js';
 
 // ---------------------------------------------------------------------------
 // Startup checks
@@ -21,12 +23,17 @@ import { indexFile } from './indexer.js';
 const apiKey = process.env.OPENAI_API_KEY;
 if (!apiKey) {
   console.error(
-    '[claude-memory] OPENAI_API_KEY is not set. Set it in your environment before starting the server.',
+    '[claude-memory] OPENAI_API_KEY is not set. Local GGUF provider will be used if available; falling back to BM25-only search.',
   );
-  process.exit(1);
 }
 
 const db = initDb(DB_PATH);
+
+// Tracks paths recently written by memory_save to suppress watcher double-index
+const recentlySaved = new Set<string>();
+
+// Initialize embedding provider chain (local GGUF -> OpenAI -> BM25-only)
+const provider = createProviderChain(apiKey, db);
 
 // ---------------------------------------------------------------------------
 // Project detection — walk up from CWD looking for .claude/ directory
@@ -119,6 +126,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'memory_get',
+      description:
+        'Read a specific memory file by path. Returns text content, resolved path, and whether content was truncated. Returns empty text (no error) if file does not exist.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          path: {
+            type: 'string',
+            description:
+              'Workspace-relative path (e.g. "MEMORY.md" or "memory/2026-02-21.md")',
+          },
+          startLine: {
+            type: 'number',
+            description: 'Optional 1-based start line number',
+          },
+          lineCount: {
+            type: 'number',
+            description: 'Optional number of lines to read (requires startLine)',
+          },
+        },
+        required: ['path'],
+      },
+    },
+    {
       name: 'memory_save',
       description:
         'Save content to memory. target="log" (default) appends to today\'s daily log. target="memory" appends to MEMORY.md with dedup check.',
@@ -156,6 +187,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return handleMemorySearch(args as { query: string; limit?: number; project?: string });
   }
 
+  if (name === 'memory_get') {
+    return handleMemoryGet(args as { path: string; startLine?: number; lineCount?: number });
+  }
+
   if (name === 'memory_save') {
     return handleMemorySave(args as { content: string; target?: 'log' | 'memory'; cwd?: string });
   }
@@ -178,7 +213,17 @@ async function handleMemorySearch(args: {
   const { query, limit = 10, project } = args;
 
   try {
-    const queryEmbedding = await embedText(db, query, apiKey!);
+    const embeddingResults = await provider.embed([query]);
+    const queryVec = embeddingResults[0];
+
+    let queryEmbedding: Buffer;
+    if (queryVec) {
+      queryEmbedding = packEmbedding(queryVec);
+    } else {
+      // BM25-only fallback: zero vector (search.ts handles zero-vector gracefully)
+      queryEmbedding = packEmbedding(new Float32Array(768));
+    }
+
     const results = search(db, queryEmbedding, query, limit, project);
     const formatted = formatResults(results);
 
@@ -196,6 +241,125 @@ async function handleMemorySearch(args: {
       isError: true,
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Tool: memory_get
+// ---------------------------------------------------------------------------
+
+async function handleMemoryGet(args: {
+  path: string;
+  startLine?: number;
+  lineCount?: number;
+}) {
+  if (!args.path || args.path.trim() === '') {
+    return {
+      content: [{ type: 'text' as const, text: 'Access denied: path must not be empty' }],
+      isError: true,
+    };
+  }
+
+  const { startLine, lineCount } = args;
+
+  // Build list of allowed roots
+  const globalRoot = path.join(os.homedir(), '.claude-memory');
+  const allowedRoots = [globalRoot];
+
+  // Also allow any detected project memory directory
+  const project = detectProject();
+  if (project) {
+    allowedRoots.push(path.join(project.root, '.claude', 'memory'));
+  }
+
+  // Resolve path safely — must stay within an allowed root
+  let resolvedPath: string | null = null;
+  for (const root of allowedRoots) {
+    const candidate = path.resolve(root, args.path);
+    if (candidate.startsWith(root + path.sep) || candidate === root) {
+      resolvedPath = candidate;
+      break;
+    }
+  }
+
+  if (!resolvedPath) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: 'Access denied: path is outside allowed memory directories',
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  // Read file — return empty on ENOENT, never throw
+  let content: string;
+  try {
+    content = await fs.readFile(resolvedPath, 'utf-8');
+  } catch (err: any) {
+    if (err.code === 'ENOENT') {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({ text: '', path: resolvedPath, truncated: false }),
+          },
+        ],
+      };
+    }
+    if (err.code === 'EISDIR') {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Access denied: path resolves to a directory, not a file',
+          },
+        ],
+        isError: true,
+      };
+    }
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Read failed: ${(err as Error).message}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  // Validate line parameters
+  if (startLine !== undefined && startLine < 1) {
+    return {
+      content: [{ type: 'text' as const, text: 'startLine must be >= 1' }],
+      isError: true,
+    };
+  }
+
+  // Slice lines if requested
+  const effectiveStartLine = startLine ?? (lineCount !== undefined ? 1 : undefined);
+  if (effectiveStartLine !== undefined) {
+    const lines = content.split('\n');
+    const start = effectiveStartLine - 1; // convert to 0-based
+    const end = lineCount !== undefined ? start + lineCount : lines.length;
+    content = lines.slice(start, end).join('\n');
+  }
+
+  // Cap at 10K chars
+  const MAX_CHARS = 10_000;
+  const truncated = content.length > MAX_CHARS;
+  if (truncated) content = content.slice(0, MAX_CHARS);
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({ text: content, path: resolvedPath, truncated }),
+      },
+    ],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +424,11 @@ async function saveToLog(
   await fs.appendFile(logPath, entry, 'utf-8');
 
   // Re-index the file
-  indexFile(db, logPath, layer, projectName);
+  await indexFile(db, logPath, layer, projectName, provider);
+
+  // Mark path as recently saved so watcher skips the imminent file event
+  recentlySaved.add(logPath);
+  setTimeout(() => recentlySaved.delete(logPath), 3000);
 
   return {
     content: [
@@ -319,7 +487,11 @@ async function saveToMemory(
   await fs.writeFile(memoryPath, newContent, 'utf-8');
 
   // Re-index the file
-  indexFile(db, memoryPath, layer, projectName);
+  await indexFile(db, memoryPath, layer, projectName, provider);
+
+  // Mark path as recently saved so watcher skips the imminent file event
+  recentlySaved.add(memoryPath);
+  setTimeout(() => recentlySaved.delete(memoryPath), 3000);
 
   return {
     content: [
@@ -336,8 +508,21 @@ async function saveToMemory(
 // ---------------------------------------------------------------------------
 
 async function main() {
+  // Start file watcher
+  startWatcher(db, provider, recentlySaved);
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Schedule backfill after event loop yields so it doesn't delay startup
+  setImmediate(async () => {
+    try {
+      await backfillEmbeddings(db, provider);
+    } catch (err) {
+      console.error('[claude-memory] Backfill error:', (err as Error).message);
+    }
+  });
+
   console.error('[claude-memory] MCP server running on stdio');
 }
 

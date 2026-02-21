@@ -43,6 +43,44 @@ function isEvergreen(filePath: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// MMR re-ranking helpers
+// ---------------------------------------------------------------------------
+
+// Jaccard similarity between two strings (tokenized on non-word chars)
+function jaccardSim(a: string, b: string): number {
+  const tokA = new Set(a.toLowerCase().split(/\W+/).filter(Boolean));
+  const tokB = new Set(b.toLowerCase().split(/\W+/).filter(Boolean));
+  if (tokA.size === 0 && tokB.size === 0) return 1;
+  if (tokA.size === 0 || tokB.size === 0) return 0;
+  let intersection = 0;
+  for (const t of tokA) if (tokB.has(t)) intersection++;
+  return intersection / (tokA.size + tokB.size - intersection);
+}
+
+// MMR re-ranking: lambda=0.7 matches OpenClaw default
+// Greedy selection: maximize lambda*relevance - (1-lambda)*maxSimilarityToSelected
+function mmrRerank(results: SearchResult[], limit: number, lambda = 0.7): SearchResult[] {
+  if (results.length === 0) return [];
+  const selected: SearchResult[] = [];
+  const remaining = [...results];
+  while (selected.length < limit && remaining.length > 0) {
+    let bestIdx = 0;
+    let bestScore = -Infinity;
+    for (let i = 0; i < remaining.length; i++) {
+      const relevance = remaining[i].score;
+      const maxSim = selected.length === 0
+        ? 0
+        : Math.max(...selected.map(s => jaccardSim(remaining[i].text, s.text)));
+      const mmrScore = lambda * relevance - (1 - lambda) * maxSim;
+      if (mmrScore > bestScore) { bestScore = mmrScore; bestIdx = i; }
+    }
+    selected.push(remaining[bestIdx]);
+    remaining.splice(bestIdx, 1);
+  }
+  return selected;
+}
+
+// ---------------------------------------------------------------------------
 // Hybrid BM25 + vector search with temporal decay
 // ---------------------------------------------------------------------------
 
@@ -63,7 +101,7 @@ export function search(
     .replace(/[^a-zA-Z0-9\s]/g, ' ') // strip FTS5 special chars
     .split(/\s+/)
     .filter(Boolean)
-    .join(' AND ');
+    .join(' OR '); // OR union: vector + BM25 scoring handles ranking; AND was too strict for multi-word queries
   const bm25Rows = db
     .prepare(
       'SELECT rowid, bm25(fts) as score FROM fts WHERE fts MATCH ? ORDER BY bm25(fts) LIMIT ?',
@@ -143,7 +181,7 @@ export function search(
     };
   });
 
-  // 7. Sort descending by score, return top `limit`
+  // 7. Sort descending by score, then MMR re-rank for diversity
   results.sort((a, b) => b.score - a.score);
-  return results.slice(0, limit);
+  return mmrRerank(results, limit);
 }

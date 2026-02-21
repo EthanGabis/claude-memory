@@ -226,7 +226,7 @@ async function main() {
     const db = initDb(DB_PATH);
     const project = findClaudeMemoryDir(cwd) ? cwd : undefined;
     const layer = project ? 'project' : 'global';
-    indexFile(db, dailyLogPath, layer, project);
+    await indexFile(db, dailyLogPath, layer, project);
     db.close();
   } catch (err) {
     console.error('[stop-hook] Re-indexing failed:', (err as Error).message);

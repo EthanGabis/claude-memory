@@ -1,7 +1,10 @@
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
-import fs from 'fs';
+import fsSync from 'fs';
+import fsAsync from 'node:fs/promises';
 import path from 'path';
+import type { EmbeddingProvider } from './providers.js';
+import { packEmbedding } from './embeddings.js';
 import { get_encoding } from 'tiktoken';
 
 // ---------------------------------------------------------------------------
@@ -129,19 +132,21 @@ function chunkText(
 
 /**
  * Index a single Markdown file — deletes existing chunks for this path,
- * then inserts new ones inside a transaction.
+ * then inserts new ones inside a transaction. When an EmbeddingProvider is
+ * supplied, embeds all chunks immediately after insertion.
  *
  * Returns the number of chunks created.
  */
-export function indexFile(
+export async function indexFile(
   db: Database,
   filePath: string,
   layer: 'global' | 'project',
   project?: string,
-): number {
+  provider?: EmbeddingProvider | null,
+): Promise<number> {
   let content: string;
   try {
-    content = fs.readFileSync(filePath, 'utf-8');
+    content = await fsAsync.readFile(filePath, 'utf-8');
   } catch (err) {
     console.warn(`[indexer] skipping unreadable file: ${filePath}`, (err as Error).message);
     return 0;
@@ -178,6 +183,20 @@ export function indexFile(
   });
 
   runTransaction(chunks);
+
+  // Embed all chunks if a provider is available
+  if (provider) {
+    const texts = chunks.map(c => c.text);
+    const embeddings = await provider.embed(texts);
+    const updateStmt = db.prepare('UPDATE chunks SET embedding = ? WHERE id = ?');
+    for (let i = 0; i < chunks.length; i++) {
+      const emb = embeddings[i];
+      if (emb != null) {
+        updateStmt.run(packEmbedding(emb), chunks[i].id);
+      }
+    }
+  }
+
   return chunks.length;
 }
 
@@ -191,9 +210,9 @@ export function indexFile(
 function collectMarkdownFiles(dirPath: string): string[] {
   const results: string[] = [];
 
-  let entries: fs.Dirent[];
+  let entries: fsSync.Dirent[];
   try {
-    entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    entries = fsSync.readdirSync(dirPath, { withFileTypes: true });
   } catch {
     console.warn(`[indexer] skipping unreadable directory: ${dirPath}`);
     return results;
@@ -218,18 +237,59 @@ function collectMarkdownFiles(dirPath: string): string[] {
  *
  * Returns total chunk count.
  */
-export function indexDirectory(
+export async function indexDirectory(
   db: Database,
   dirPath: string,
   layer: 'global' | 'project',
   project?: string,
-): number {
+  provider?: EmbeddingProvider | null,
+): Promise<number> {
   const files = collectMarkdownFiles(dirPath);
   let totalChunks = 0;
 
   for (const file of files) {
-    totalChunks += indexFile(db, file, layer, project);
+    totalChunks += await indexFile(db, file, layer, project, provider);
   }
 
   return totalChunks;
+}
+
+// ---------------------------------------------------------------------------
+// Backfill embeddings for chunks that have none
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-index all files that contain at least one chunk with a NULL embedding.
+ * Yields the event loop between files to avoid blocking.
+ */
+export async function backfillEmbeddings(
+  db: Database,
+  provider: EmbeddingProvider,
+): Promise<void> {
+  const paths = db.prepare(
+    "SELECT DISTINCT path FROM chunks WHERE embedding IS NULL"
+  ).all() as { path: string }[];
+
+  for (const { path: filePath } of paths) {
+    // Detect layer and project from path
+    const layer: 'global' | 'project' = filePath.includes('/.claude-memory/') ? 'global' : 'project';
+    const segments = filePath.split('/');
+    let project: string | undefined;
+    if (layer === 'project') {
+      // Find the segment before .claude in the path
+      const claudeIdx = segments.indexOf('.claude');
+      if (claudeIdx > 0) {
+        project = segments[claudeIdx - 1];
+      }
+    }
+
+    try {
+      await indexFile(db, filePath, layer, project, provider);
+    } catch {
+      // Skip unreadable files silently
+    }
+
+    // Yield to event loop between files to avoid blocking
+    await new Promise(r => setTimeout(r, 0));
+  }
 }
