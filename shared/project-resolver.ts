@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { extractFilePathsFromJsonl } from './file-path-extractor.js';
+import { inferProjectFromPaths } from './project-inferrer.js';
 
 export interface ProjectInfo {
   name: string | null;       // human-readable basename or null
@@ -26,16 +28,15 @@ export function resolveProjectFromJsonlPath(jsonlPath: string): ProjectInfo {
 }
 
 function resolveFromJsonlSync(jsonlPath: string): ProjectInfo {
-  // C1: Default isRoot to false — prevents cross-project memory leakage when CWD can't be read
   const fallback: ProjectInfo = { name: null, isRoot: false, fullPath: null };
 
-  // W2: FD wrapped in try/finally to prevent leak if readSync/parse throws
+  // --- Phase 1: Existing cwd scan ---
+  let cwdResult: ProjectInfo | null = null;
+
   let fd: number | null = null;
   try {
-    // W5: Stream until newline (bounded by MAX_FIRST_LINE) instead of fixed-size read.
-    // Prevents silent fallback to null when first JSONL line exceeds the read buffer.
     const CHUNK_SIZE = 16384;
-    const MAX_FIRST_LINE = 65536; // 64KB safety cap
+    const MAX_FIRST_LINE = 65536;
     const MAX_LINES_TO_SCAN = 10;
     fd = fs.openSync(jsonlPath, 'r');
 
@@ -50,7 +51,6 @@ function resolveFromJsonlSync(jsonlPath: string): ProjectInfo {
       accumulated += buf.toString('utf-8', 0, bytesRead);
       offset += bytesRead;
 
-      // Process all complete lines available in the accumulated buffer
       let newlineIdx: number;
       while ((newlineIdx = accumulated.indexOf('\n')) >= 0 && linesScanned < MAX_LINES_TO_SCAN) {
         const line = accumulated.slice(0, newlineIdx);
@@ -65,37 +65,55 @@ function resolveFromJsonlSync(jsonlPath: string): ProjectInfo {
           if (typeof cwd === 'string' && cwd) {
             const name = path.basename(cwd);
             const isRoot = isProjectRoot(cwd);
-            return { name, isRoot, fullPath: cwd };
+            cwdResult = { name, isRoot, fullPath: cwd };
+            break;
           }
-        } catch {
-          // Malformed line — skip and try the next one
-        }
+        } catch {}
       }
+      if (cwdResult) break;
     }
 
-    // No complete line with cwd found yet — try whatever remains in the buffer
-    if (linesScanned < MAX_LINES_TO_SCAN && accumulated.trim()) {
+    // Check remaining buffer
+    if (!cwdResult && linesScanned < MAX_LINES_TO_SCAN && accumulated.trim()) {
       try {
         const entry = JSON.parse(accumulated);
         const cwd = entry.cwd;
         if (typeof cwd === 'string' && cwd) {
           const name = path.basename(cwd);
           const isRoot = isProjectRoot(cwd);
-          return { name, isRoot, fullPath: cwd };
+          cwdResult = { name, isRoot, fullPath: cwd };
         }
-      } catch {
-        // Malformed trailing content — fall through to fallback
-      }
+      } catch {}
     }
-
-    return fallback;
   } catch {
-    return fallback;
+    // File read error
   } finally {
     if (fd !== null) {
       try { fs.closeSync(fd); } catch {}
     }
   }
+
+  // --- Phase 2: File-path inference fallback ---
+  // Only invoke if cwd result is null or is a root directory
+  if (cwdResult && !cwdResult.isRoot) {
+    return cwdResult; // cwd found a specific project -- use it
+  }
+
+  // cwd is null or root -- try file-path inference
+  try {
+    const filePaths = extractFilePathsFromJsonl(jsonlPath, 200);
+    if (filePaths.length >= 2) {
+      const inferred = inferProjectFromPaths(filePaths);
+      if (inferred && !inferred.isRoot) {
+        return inferred; // file-path inference found a specific project
+      }
+    }
+  } catch {
+    // Inference failed -- fall through
+  }
+
+  // Return whatever we had (cwdResult or fallback)
+  return cwdResult ?? fallback;
 }
 
 /**

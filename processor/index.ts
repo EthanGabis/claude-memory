@@ -9,6 +9,9 @@ import { SessionTailer } from './session-tailer.js';
 import { runConsolidation } from './consolidator.js';
 import { createEngramServer, SOCKET_PATH } from '../shared/uds.js';
 import { resolveProjectFromJsonlPath } from '../shared/project-resolver.js';
+import { upsertProject } from '../shared/project-describer.js';
+import { extractFilePathsFromJsonl } from '../shared/file-path-extractor.js';
+import { inferProjectFromPaths, PROJECT_MARKERS } from '../shared/project-inferrer.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -249,6 +252,16 @@ function startTailer(jsonlPath: string): void {
 
   const llmApiKey = process.env.OPENAI_API_KEY ?? '';
   const projectInfo = resolveProjectFromJsonlPath(jsonlPath);
+
+  // Auto-populate projects table
+  if (projectInfo.name && projectInfo.fullPath && !projectInfo.isRoot) {
+    try {
+      upsertProject(db, projectInfo.name, projectInfo.fullPath);
+    } catch (err) {
+      console.error(`[engram] Project upsert failed for "${projectInfo.name}": ${(err as Error).message}`);
+    }
+  }
+
   const tailer = new SessionTailer(jsonlPath, stateStore, embedProvider, db, llmApiKey, projectInfo);
   tailers.set(jsonlPath, tailer);
 
@@ -260,6 +273,129 @@ function startTailer(jsonlPath: string): void {
 
 // Global embed provider — initialized in main()
 let embedProvider: LocalGGUFProvider;
+
+/**
+ * On startup, re-resolve all global episodes whose sessions might belong to a project.
+ * Scans JSONL files for file paths and infers the real project.
+ * Runs once per startup -- safe to repeat (idempotent).
+ */
+async function runStartupMigration(database: Database): Promise<void> {
+  console.error('[engram] Running startup migration: re-resolving global episodes...');
+
+  // Step 1: Get all session_ids that have global episodes
+  const globalSessions = database.prepare(`
+    SELECT DISTINCT session_id FROM episodes WHERE scope = 'global'
+  `).all() as { session_id: string }[];
+
+  if (globalSessions.length === 0) {
+    console.error('[engram] No global episodes to re-resolve');
+    return;
+  }
+
+  console.error(`[engram] Found ${globalSessions.length} sessions with global episodes`);
+
+  // Step 2: Build session -> JSONL path mapping
+  const sessionToJsonl = new Map<string, string>();
+  try {
+    const projectEntries = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true });
+    for (const projectDir of projectEntries) {
+      if (!projectDir.isDirectory()) continue;
+      const projectPath = path.join(PROJECTS_DIR, projectDir.name);
+      try {
+        const files = fs.readdirSync(projectPath, { withFileTypes: true });
+        for (const file of files) {
+          if (!file.name.endsWith('.jsonl') || !file.isFile()) continue;
+          const sessionId = path.basename(file.name, '.jsonl');
+          sessionToJsonl.set(sessionId, path.join(projectPath, file.name));
+        }
+      } catch {}
+    }
+  } catch {}
+
+  // Step 3: For each global session, try file-path inference
+  let rescoped = 0;
+  let projectsDiscovered = 0;
+
+  const updateStmt = database.prepare(
+    `UPDATE episodes SET scope = 'project', project = ? WHERE session_id = ? AND scope = 'global'`
+  );
+
+  // Batch updates in groups of 20 sessions per transaction to avoid holding
+  // the WAL lock for too long on large databases
+  const BATCH_SIZE = 20;
+  for (let i = 0; i < globalSessions.length; i += BATCH_SIZE) {
+    const batch = globalSessions.slice(i, i + BATCH_SIZE);
+    database.exec('BEGIN TRANSACTION');
+    try {
+      for (const { session_id } of batch) {
+        const jsonlPath = sessionToJsonl.get(session_id);
+        if (!jsonlPath) continue;
+
+        try {
+          const filePaths = extractFilePathsFromJsonl(jsonlPath, 200);
+          if (filePaths.length < 2) continue;
+
+          const inferred = inferProjectFromPaths(filePaths);
+          if (!inferred || !inferred.name || inferred.isRoot) continue;
+
+          const result = updateStmt.run(inferred.name, session_id);
+          const changes = (result as any).changes ?? 0;
+          rescoped += changes;
+
+          // Upsert into projects table
+          if (inferred.fullPath) {
+            upsertProject(database, inferred.name, inferred.fullPath);
+            projectsDiscovered++;
+          }
+        } catch {}
+      }
+
+      database.exec('COMMIT');
+    } catch (err) {
+      try { database.exec('ROLLBACK'); } catch {}
+      console.error(`[engram] Startup migration batch failed (sessions ${i}-${i + batch.length}): ${(err as Error).message}`);
+      // Continue with next batch instead of aborting entirely
+    }
+  }
+
+  console.error(`[engram] Startup migration: ${rescoped} episodes re-scoped, ${projectsDiscovered} projects discovered`);
+}
+
+/**
+ * Scan CLAUDE_MEMORY_PROJECT_ROOTS for subdirectories that look like projects.
+ * Upsert them into the projects table.
+ */
+async function runProjectDiscovery(database: Database): Promise<void> {
+  const roots = process.env.CLAUDE_MEMORY_PROJECT_ROOTS;
+  if (!roots) return;
+
+  let discovered = 0;
+  for (const root of roots.split(':').map(r => r.trim()).filter(Boolean)) {
+    try {
+      const entries = fs.readdirSync(root, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if (entry.name.startsWith('.')) continue; // skip hidden dirs
+
+        const dirPath = path.join(root, entry.name);
+
+        // Check for project markers (imported from project-inferrer.ts)
+        const isProject = PROJECT_MARKERS.some(m => {
+          try { fs.statSync(path.join(dirPath, m)); return true; } catch { return false; }
+        });
+
+        if (isProject) {
+          upsertProject(database, entry.name, dirPath);
+          discovered++;
+        }
+      }
+    } catch {}
+  }
+
+  if (discovered > 0) {
+    console.error(`[engram] Auto-discovered ${discovered} projects from filesystem`);
+  }
+}
 
 async function main(): Promise<void> {
   console.error('[engram] Starting Engram Processor...');
@@ -298,6 +434,12 @@ async function main(): Promise<void> {
   stateStore = new StateStore();
   stateStore.load();
   stateStore.startPeriodicSave();
+
+  // 5.1. Startup migration: re-resolve global episodes using file-path inference
+  await runStartupMigration(db);
+
+  // 5.2. Auto-discover projects from filesystem
+  await runProjectDiscovery(db);
 
   // 5.5. Start UDS listener for hook-to-daemon communication
   udsServer = createEngramServer(SOCKET_PATH, async (msg) => {

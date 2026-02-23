@@ -8,6 +8,10 @@ import type { StateStore } from './state.js';
 import { extractMemories, upsertEpisode, fetchEpisodeSnapshot, batchEmbedCandidates, type UpsertResult } from './extractor.js';
 import { writeRecollections, refreshRecollection } from './recollection-writer.js';
 import { type ProjectInfo } from '../shared/project-resolver.js';
+import { extractFilePathsFromEntry } from '../shared/file-path-extractor.js';
+import { inferProjectFromPaths } from '../shared/project-inferrer.js';
+import { clearProjectCache } from '../shared/project-resolver.js';
+import { upsertProject } from '../shared/project-describer.js';
 import { acquireExtractionSlot, releaseExtractionSlot } from './semaphore.js';
 
 // ---------------------------------------------------------------------------
@@ -94,6 +98,11 @@ export class SessionTailer {
   private started = false;
   private caughtUp = false; // true once initial backlog is fully read
   private static readonly MAX_EXTRACTION_BUFFER = 100;
+
+  // Live re-resolution state
+  private observedFilePaths: Set<string> = new Set();
+  private hasReResolved = false;
+  private readonly RE_RESOLVE_PATH_THRESHOLD = 5;
 
   constructor(
     jsonlPath: string,
@@ -287,6 +296,16 @@ export class SessionTailer {
     const type = entry.type ?? entry.message?.role;
     if (type !== 'user' && type !== 'assistant') return;
 
+    // --- Live re-resolution: track file paths from tool_use blocks ---
+    // IMPORTANT: Must run BEFORE content check -- tool_use-only entries have null content
+    if (type === 'assistant' && !this.hasReResolved) {
+      const paths = extractFilePathsFromEntry(entry);
+      for (const p of paths) this.observedFilePaths.add(p);
+      if (this.observedFilePaths.size >= this.RE_RESOLVE_PATH_THRESHOLD) {
+        this.attemptReResolution();
+      }
+    }
+
     const content = extractContent(entry);
     if (!content) return;
 
@@ -352,6 +371,57 @@ export class SessionTailer {
       if (updated.messagesSinceExtraction >= threshold || timeSinceLast >= WARM_TIME_THRESHOLD_MS) {
         await this.extract();
       }
+    }
+  }
+
+  /**
+   * Attempt to re-resolve the project from observed file paths.
+   * Only upgrades: null/root -> specific project. Never downgrades.
+   * Only runs once per session to avoid flip-flopping.
+   */
+  private attemptReResolution(): void {
+    if (this.hasReResolved) return;
+    this.hasReResolved = true; // Only try once
+
+    // Only re-resolve if current project is null or root
+    if (this.projectName && !this.projectIsRoot) return;
+
+    const inferred = inferProjectFromPaths([...this.observedFilePaths]);
+    if (!inferred || !inferred.name || inferred.isRoot) return;
+
+    const oldProject = this.projectName;
+    const oldIsRoot = this.projectIsRoot;
+    this.projectName = inferred.name;
+    this.projectIsRoot = false;
+
+    // Invalidate resolver cache so future reads get the corrected project
+    clearProjectCache();
+
+    // Register the discovered project in the projects table
+    if (inferred.fullPath) {
+      try { upsertProject(this.db, inferred.name, inferred.fullPath); } catch {}
+    }
+
+    console.error(
+      `[tailer:${this.sessionId.slice(0, 8)}] Re-resolved project: "${oldProject}" (root=${oldIsRoot}) -> "${inferred.name}"`
+    );
+
+    // Re-scope already-extracted global episodes from this session
+    try {
+      const result = this.db.prepare(
+        `UPDATE episodes SET project = ?, scope = 'project'
+         WHERE session_id = ? AND scope = 'global'`
+      ).run(inferred.name, this.sessionId);
+      const changes = (result as any).changes ?? 0;
+      if (changes > 0) {
+        console.error(
+          `[tailer:${this.sessionId.slice(0, 8)}] Re-scoped ${changes} episodes to project "${inferred.name}"`
+        );
+      }
+    } catch (err) {
+      console.error(
+        `[tailer:${this.sessionId.slice(0, 8)}] Re-scope failed: ${(err as Error).message}`
+      );
     }
   }
 

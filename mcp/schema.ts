@@ -270,6 +270,56 @@ export function initDb(dbPath: string): Database {
     }
   }
 
+  // --- Schema version 5 migration: projects table ---
+  const v5Row = db.query<{ value: string }, []>(
+    `SELECT value FROM _meta WHERE key = 'schema_version'`
+  ).get();
+  const v5Version = v5Row ? parseInt(v5Row.value, 10) : 1;
+
+  if (v5Version < 5) {
+    const runV5Migration = () => {
+      db.exec(`BEGIN EXCLUSIVE`);
+      try {
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS projects (
+            full_path   TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            description TEXT,
+            source      TEXT NOT NULL DEFAULT 'auto',
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_projects_name ON projects(name);
+
+          UPDATE _meta SET value = '5' WHERE key = 'schema_version';
+        `);
+        db.exec(`COMMIT`);
+      } catch (err) {
+        try { db.exec(`ROLLBACK`); } catch {}
+        throw err;
+      }
+    };
+
+    try {
+      runV5Migration();
+    } catch (err) {
+      if ((err as Error).message?.includes('SQLITE_BUSY') || (err as Error).message?.includes('database is locked')) {
+        console.error('[schema] v5 migration busy — retrying in 6s');
+        Bun.sleepSync(6000);
+        const recheck = db.query<{ value: string }, []>(
+          `SELECT value FROM _meta WHERE key = 'schema_version'`
+        ).get();
+        if (recheck && parseInt(recheck.value, 10) >= 5) {
+          console.error('[schema] v5 migration completed by other process');
+        } else {
+          runV5Migration();
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
   return db;
 }
 
