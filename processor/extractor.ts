@@ -229,6 +229,7 @@ export async function upsertEpisode(
   candidate: CandidateMemory,
   sessionId: string,
   projectName: string | null,
+  isRoot: boolean,
   embedProvider: EmbeddingProvider,
   db: Database,
   existingRows: EpisodeRow[],
@@ -250,7 +251,16 @@ export async function upsertEpisode(
 
   // Fix #6: Filter by compatible scope/project before similarity comparison
   // Global candidates match only global episodes; project candidates match same-project episodes
-  const effectiveScope = (candidate.scope === 'project' && !projectName) ? 'global' : candidate.scope;
+  // One-directional override: project sessions promote global→project; root sessions force global
+  let effectiveScope = candidate.scope;
+  if (projectName && !isRoot && candidate.scope === 'global') {
+    // LLM said global but we're in a specific project — override to project
+    effectiveScope = 'project';
+  }
+  if (!projectName || isRoot) {
+    // Root/unknown session — everything is global
+    effectiveScope = 'global';
+  }
   const compatibleRows = existingRows.filter(row => {
     if (effectiveScope === 'global') return row.scope === 'global';
     return row.scope === 'project' && row.project === projectName;

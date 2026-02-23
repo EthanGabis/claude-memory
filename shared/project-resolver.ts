@@ -12,7 +12,7 @@ const jsonlCache = new Map<string, ProjectInfo>();
 
 /**
  * Resolve project info from a JSONL transcript path.
- * Reads the first entry's `cwd` field, uses path.basename(cwd) as project name.
+ * Scans up to the first 10 entries for a `cwd` field, uses path.basename(cwd) as project name.
  * Checks CLAUDE_MEMORY_PROJECT_ROOTS env var for isRoot detection.
  * Result is cached per JSONL path.
  */
@@ -36,39 +36,59 @@ function resolveFromJsonlSync(jsonlPath: string): ProjectInfo {
     // Prevents silent fallback to null when first JSONL line exceeds the read buffer.
     const CHUNK_SIZE = 16384;
     const MAX_FIRST_LINE = 65536; // 64KB safety cap
+    const MAX_LINES_TO_SCAN = 10;
     fd = fs.openSync(jsonlPath, 'r');
 
     let accumulated = '';
     let offset = 0;
-    let firstLine: string | null = null;
+    let linesScanned = 0;
 
-    while (offset < MAX_FIRST_LINE) {
+    while (offset < MAX_FIRST_LINE && linesScanned < MAX_LINES_TO_SCAN) {
       const buf = Buffer.alloc(CHUNK_SIZE);
       const bytesRead = fs.readSync(fd, buf, 0, CHUNK_SIZE, offset);
       if (bytesRead === 0) break;
       accumulated += buf.toString('utf-8', 0, bytesRead);
       offset += bytesRead;
 
-      const newlineIdx = accumulated.indexOf('\n');
-      if (newlineIdx >= 0) {
-        firstLine = accumulated.slice(0, newlineIdx);
-        break;
+      // Process all complete lines available in the accumulated buffer
+      let newlineIdx: number;
+      while ((newlineIdx = accumulated.indexOf('\n')) >= 0 && linesScanned < MAX_LINES_TO_SCAN) {
+        const line = accumulated.slice(0, newlineIdx);
+        accumulated = accumulated.slice(newlineIdx + 1);
+        linesScanned++;
+
+        if (!line.trim()) continue;
+
+        try {
+          const entry = JSON.parse(line);
+          const cwd = entry.cwd;
+          if (typeof cwd === 'string' && cwd) {
+            const name = path.basename(cwd);
+            const isRoot = isProjectRoot(cwd);
+            return { name, isRoot, fullPath: cwd };
+          }
+        } catch {
+          // Malformed line — skip and try the next one
+        }
       }
     }
 
-    // If no newline found, use whatever we accumulated (truncated first line)
-    if (firstLine === null) firstLine = accumulated;
+    // No complete line with cwd found yet — try whatever remains in the buffer
+    if (linesScanned < MAX_LINES_TO_SCAN && accumulated.trim()) {
+      try {
+        const entry = JSON.parse(accumulated);
+        const cwd = entry.cwd;
+        if (typeof cwd === 'string' && cwd) {
+          const name = path.basename(cwd);
+          const isRoot = isProjectRoot(cwd);
+          return { name, isRoot, fullPath: cwd };
+        }
+      } catch {
+        // Malformed trailing content — fall through to fallback
+      }
+    }
 
-    if (!firstLine.trim()) return fallback;
-
-    const entry = JSON.parse(firstLine);
-    const cwd = entry.cwd;
-    if (typeof cwd !== 'string' || !cwd) return fallback;
-
-    const name = path.basename(cwd);
-    const isRoot = isProjectRoot(cwd);
-
-    return { name, isRoot, fullPath: cwd };
+    return fallback;
   } catch {
     return fallback;
   } finally {

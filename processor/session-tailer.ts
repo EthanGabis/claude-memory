@@ -424,6 +424,7 @@ export class SessionTailer {
               candidate,
               this.sessionId,
               this.projectName,
+              this.projectIsRoot,
               this.embedProvider,
               this.db,
               episodeSnapshot,
@@ -432,7 +433,13 @@ export class SessionTailer {
             if (upsertResult.action === 'add') {
               added++;
               if (upsertResult.embedding) {
-                const effectiveScope = (candidate.scope === 'project' && !this.projectName) ? 'global' : candidate.scope;
+                let effectiveScope = candidate.scope;
+                if (this.projectName && !this.projectIsRoot && candidate.scope === 'global') {
+                  effectiveScope = 'project';
+                }
+                if (!this.projectName || this.projectIsRoot) {
+                  effectiveScope = 'global';
+                }
                 episodeSnapshot.push({
                   id: upsertResult.id!,
                   summary: candidate.summary,
