@@ -45,6 +45,7 @@ export class LocalGGUFProvider implements EmbeddingProvider {
 
         // resolveModelFile auto-downloads if not cached
         console.error('[providers] Resolving local GGUF model...');
+        // @ts-ignore — resolveModelFile signature varies across node-llama-cpp versions; works at runtime
         const modelPath = await resolveModelFile(GGUF_MODEL_URI, MODELS_DIR, {
           cli: false,
         });
@@ -65,10 +66,13 @@ export class LocalGGUFProvider implements EmbeddingProvider {
 
   async embed(texts: string[]): Promise<(Float32Array | null)[]> {
     await this.ensureContext();
+    if (!this.context) {
+      throw new Error('Embedding context failed to initialize');
+    }
 
     const results: Float32Array[] = [];
     for (const text of texts) {
-      const embedding = await this.context!.getEmbeddingFor(text);
+      const embedding = await this.context.getEmbeddingFor(text);
       // embedding.vector is number[] — convert to Float32Array
       const vec = new Float32Array(embedding.vector);
       if (vec.length !== DIMS) {
@@ -196,10 +200,7 @@ export class FallbackChain implements EmbeddingProvider {
   async embed(texts: string[]): Promise<(Float32Array | null)[]> {
     for (const provider of this.providers) {
       try {
-        const name = provider.constructor.name;
-        console.error(`[providers] Trying ${name}...`);
         const result = await provider.embed(texts);
-        console.error(`[providers] ${name} succeeded`);
         return result;
       } catch (err) {
         const name = provider.constructor.name;

@@ -5,7 +5,9 @@
   "scripts": {
     "start": "bun mcp/server.ts",
     "migrate": "bun migrate/extract.ts && bun migrate/write-logs.ts && bun migrate/generate-memory.ts",
-    "install-plugin": "bash scripts/install.sh"
+    "install-plugin": "bash scripts/install.sh",
+    "processor": "bun processor/index.ts",
+    "inspect": "bun scripts/inspect.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

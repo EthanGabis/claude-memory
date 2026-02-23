@@ -6,11 +6,66 @@ import { initDb, DB_PATH } from '../mcp/schema.js';
 import { indexFile } from '../mcp/indexer.js';
 
 // ---------------------------------------------------------------------------
+// Stop-nudge constants
+// ---------------------------------------------------------------------------
+
+const STOP_NUDGE_STATE_PATH = path.join(os.homedir(), '.claude-memory', 'stop-nudge-state.json');
+const GLOBAL_MEMORY_PATH = path.join(os.homedir(), '.claude-memory', 'MEMORY.md');
+const SUBSTANTIVE_THRESHOLD = 1000; // chars
+const MEMORY_RECENT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const NUDGE_STALE_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// ---------------------------------------------------------------------------
+// Stop-nudge helpers
+// ---------------------------------------------------------------------------
+
+interface NudgeState {
+  sessions: Record<string, { nudged_at: number }>;
+}
+
+function readNudgeState(): NudgeState {
+  try {
+    const raw = fs.readFileSync(STOP_NUDGE_STATE_PATH, 'utf-8');
+    const parsed = JSON.parse(raw) as NudgeState;
+    // Clean up entries older than 24 hours
+    const now = Date.now();
+    const cleaned: NudgeState = { sessions: {} };
+    for (const [sid, entry] of Object.entries(parsed.sessions ?? {})) {
+      if (now - (entry.nudged_at ?? 0) < NUDGE_STALE_MS) {
+        cleaned.sessions[sid] = entry;
+      }
+    }
+    return cleaned;
+  } catch {
+    return { sessions: {} };
+  }
+}
+
+function writeNudgeState(state: NudgeState): void {
+  try {
+    fs.mkdirSync(path.dirname(STOP_NUDGE_STATE_PATH), { recursive: true });
+    fs.writeFileSync(STOP_NUDGE_STATE_PATH, JSON.stringify(state, null, 2));
+  } catch {
+    // fail silently
+  }
+}
+
+function wasMemoryRecentlyWritten(): boolean {
+  try {
+    const stat = fs.statSync(GLOBAL_MEMORY_PATH);
+    return Date.now() - stat.mtimeMs < MEMORY_RECENT_WINDOW_MS;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 interface HookPayload {
   session_id?: string;
+  sessionId?: string;
   cwd?: string;
   transcript?: Array<{ role: string; content: string }> | string;
 }
@@ -102,26 +157,31 @@ async function summariseWithAI(transcriptText: string): Promise<SessionSummary |
   const openai = new OpenAI({ apiKey });
 
   try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.3,
-      messages: [
-        {
-          role: 'system',
-          content: `You summarise Claude Code session transcripts into structured notes.
+    const response = await Promise.race([
+      openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.3,
+        messages: [
+          {
+            role: 'system',
+            content: `You summarise Claude Code session transcripts into structured notes.
 Respond with ONLY a JSON object (no markdown fences) with these four string fields:
 - request: what the user asked for (1-2 sentences)
 - investigated: what was explored or read (1-2 sentences)
 - learned: key discoveries or decisions (1-2 sentences)
 - completed: what was accomplished (1-2 sentences)
 Keep each field concise. If a field has no relevant info, use "N/A".`,
-        },
-        {
-          role: 'user',
-          content: transcriptText.slice(0, 30_000), // cap input to avoid token limits
-        },
-      ],
-    });
+          },
+          {
+            role: 'user',
+            content: transcriptText.slice(0, 30_000), // cap input to avoid token limits
+          },
+        ],
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('AI summarization timed out after 30s')), 30_000),
+      ),
+    ]);
 
     const text = response.choices[0]?.message?.content?.trim();
     if (!text) return null;
@@ -194,9 +254,39 @@ async function main() {
   }
 
   const cwd = payload.cwd ?? process.cwd();
+  const sessionId = (payload.session_id ?? payload.sessionId ?? '') as string;
 
   // 2. Flatten transcript
   const transcriptText = flattenTranscript(payload.transcript);
+
+  // 2b. One-time memory nudge — block stop if session was substantive and no MEMORY.md writes
+  try {
+    if (transcriptText.length > SUBSTANTIVE_THRESHOLD && sessionId) {
+      const nudgeState = readNudgeState();
+
+      if (!nudgeState.sessions[sessionId]) {
+        // First stop attempt for this session — check if MEMORY.md was recently written
+        if (!wasMemoryRecentlyWritten()) {
+          // Record that we nudged this session
+          nudgeState.sessions[sessionId] = { nudged_at: Date.now() };
+          writeNudgeState(nudgeState);
+
+          // Block the stop and ask the agent to save memories
+          process.stdout.write(
+            JSON.stringify({
+              decision: 'block',
+              reason:
+                "Before ending: you had a substantive session. Save any durable facts (preferences, decisions, debugging insights) to memory via memory_save(target='memory'). If nothing to save, say 'nothing to save' and I'll let you end.",
+            }) + '\n',
+          );
+          process.exit(0);
+        }
+      }
+      // If already nudged, fall through to normal stop behavior
+    }
+  } catch {
+    // Nudge logic failed — fall through to normal stop behavior
+  }
 
   // 3. Summarise (AI or fallback)
   let summary: SessionSummary;
@@ -222,14 +312,15 @@ async function main() {
   fs.appendFileSync(dailyLogPath, entry + '\n');
 
   // 5. Background re-index
+  const db = initDb(DB_PATH);
   try {
-    const db = initDb(DB_PATH);
-    const project = findClaudeMemoryDir(cwd) ? cwd : undefined;
-    const layer = project ? 'project' : 'global';
-    await indexFile(db, dailyLogPath, layer, project);
-    db.close();
+    const projectName = findClaudeMemoryDir(cwd) ? path.basename(cwd) : undefined;
+    const layer = projectName ? 'project' : 'global';
+    await indexFile(db, dailyLogPath, layer, projectName);
   } catch (err) {
     console.error('[stop-hook] Re-indexing failed:', (err as Error).message);
+  } finally {
+    db.close();
   }
 }
 

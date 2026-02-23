@@ -28,7 +28,10 @@ export function cosineSimilarity(a: Buffer, b: Buffer): number {
   const vb = unpackEmbedding(b);
 
   // Dimension mismatch guard — incompatible embeddings score 0
-  if (va.length !== vb.length) return 0;
+  if (va.length !== vb.length) {
+    console.error(`[embeddings] Dimension mismatch: ${va.length} vs ${vb.length} — returning 0`);
+    return 0;
+  }
 
   let dot = 0;
   let normA = 0;

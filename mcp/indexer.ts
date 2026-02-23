@@ -165,7 +165,9 @@ export async function indexFile(
     VALUES ($id, $path, $layer, $project, $startLine, $endLine, $hash, $text, NULL, $updatedAt)
   `);
 
-  const runTransaction = db.transaction((chunks: ChunkRecord[]) => {
+  const updateEmbStmt = db.prepare('UPDATE chunks SET embedding = ? WHERE id = ?');
+
+  const runTransaction = db.transaction((chunks: ChunkRecord[], embeddings: (Float32Array | null)[] | null) => {
     deleteStmt.run(filePath);
     for (const chunk of chunks) {
       insertStmt.run({
@@ -180,22 +182,27 @@ export async function indexFile(
         $updatedAt: now,
       });
     }
-  });
-
-  runTransaction(chunks);
-
-  // Embed all chunks if a provider is available
-  if (provider) {
-    const texts = chunks.map(c => c.text);
-    const embeddings = await provider.embed(texts);
-    const updateStmt = db.prepare('UPDATE chunks SET embedding = ? WHERE id = ?');
-    for (let i = 0; i < chunks.length; i++) {
-      const emb = embeddings[i];
-      if (emb != null) {
-        updateStmt.run(packEmbedding(emb), chunks[i].id);
+    // I13: Embed updates inside the same transaction so a crash can't leave
+    // chunks with null embeddings after embeddings were successfully computed
+    if (embeddings) {
+      for (let i = 0; i < chunks.length; i++) {
+        const emb = embeddings[i];
+        if (emb != null) {
+          updateEmbStmt.run(packEmbedding(emb), chunks[i].id);
+        }
       }
     }
+  });
+
+  // Compute embeddings BEFORE the transaction (async I/O required)
+  let embeddings: (Float32Array | null)[] | null = null;
+  if (provider) {
+    const texts = chunks.map(c => c.text);
+    embeddings = await provider.embed(texts);
   }
+
+  // Run DELETE + INSERT + UPDATE all atomically
+  runTransaction(chunks, embeddings);
 
   return chunks.length;
 }
@@ -285,8 +292,8 @@ export async function backfillEmbeddings(
 
     try {
       await indexFile(db, filePath, layer, project, provider);
-    } catch {
-      // Skip unreadable files silently
+    } catch (err) {
+      console.error(`[indexer] Backfill failed for ${path.basename(filePath)}: ${(err as Error).message}`);
     }
 
     // Yield to event loop between files to avoid blocking

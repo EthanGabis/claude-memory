@@ -28,6 +28,8 @@ import { get_encoding } from 'tiktoken';
 // ---------------------------------------------------------------------------
 
 const GLOBAL_MEMORY_PATH = path.join(os.homedir(), '.claude-memory', 'MEMORY.md');
+const COMPACT_PENDING_PATH = path.join(os.homedir(), '.claude-memory', 'compact-pending.json');
+const COMPACT_FLAG_MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes
 const MAX_GLOBAL_TOKENS = 4000;
 const MAX_PROJECT_TOKENS = 4000;
 const MAX_LOG_TOKENS = 2000;
@@ -312,8 +314,45 @@ function main(): void {
   // 7. Apply hard 8000-token cap
   parts = applyHardCap(parts);
 
-  // 8. Output JSON to stdout
-  const context = assembleContext(parts);
+  // 8. Assemble context
+  let context = assembleContext(parts);
+
+  // 9. Check for post-compaction flag and inject recovery nudge
+  const sessionId = typeof payload.session_id === 'string'
+    ? payload.session_id
+    : typeof payload.sessionId === 'string'
+      ? payload.sessionId
+      : '';
+
+  try {
+    if (fs.existsSync(COMPACT_PENDING_PATH)) {
+      const flagRaw = fs.readFileSync(COMPACT_PENDING_PATH, 'utf-8');
+      const flag = JSON.parse(flagRaw) as { timestamp?: number; session_id?: string };
+      const age = Date.now() - (flag.timestamp ?? 0);
+
+      // Only consume the flag if it belongs to this session (or has no session_id)
+      if (flag.session_id && flag.session_id !== sessionId) {
+        // Not our flag — leave it for the correct session
+      } else {
+        if (age < COMPACT_FLAG_MAX_AGE_MS) {
+          // Fresh flag — inject compaction recovery message
+          context +=
+            '\n\n**IMPORTANT: This session was just compacted. If you had unsaved durable knowledge (user preferences, architecture decisions, debugging insights), save them now via memory_save(target=\'memory\'). If nothing to save, continue normally.**';
+        }
+
+        // Clean up the flag (it's ours or has no session_id)
+        try {
+          fs.unlinkSync(COMPACT_PENDING_PATH);
+        } catch {
+          // ignore cleanup failure
+        }
+      }
+    }
+  } catch {
+    // fail silently — compaction detection is best-effort
+  }
+
+  // 10. Output JSON to stdout
   process.stdout.write(JSON.stringify({ context }) + '\n');
 
   process.exit(0);

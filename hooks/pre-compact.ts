@@ -28,6 +28,8 @@ import { indexFile } from '../mcp/indexer.js';
 
 const TOKEN_THRESHOLD = 150_000;
 const FLUSH_STATE_PATH = path.join(os.homedir(), '.claude-memory', 'flush-state.json');
+const COMPACT_PENDING_PATH = path.join(os.homedir(), '.claude-memory', 'compact-pending.json');
+const FLUSH_MARKER_PATH = path.join(os.homedir(), '.claude-memory', 'flush-marker.json');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -214,6 +216,24 @@ async function main(): Promise<void> {
 
   fs.appendFileSync(dailyLogPath, entry);
 
+  // 5b. Write compact-pending flag for session-start post-compaction detection
+  try {
+    fs.mkdirSync(path.dirname(COMPACT_PENDING_PATH), { recursive: true });
+    fs.writeFileSync(
+      COMPACT_PENDING_PATH,
+      JSON.stringify({ timestamp: Date.now(), session_id: sessionId }),
+    );
+  } catch {
+    // fail silently — flag is a best-effort nudge
+  }
+
+  // 5c. Clean up flush marker for next compaction cycle
+  try {
+    fs.unlinkSync(FLUSH_MARKER_PATH);
+  } catch {
+    // Marker may not exist — that's fine
+  }
+
   // 6. Update flush state
   if (sessionId) {
     flushState[sessionId] = true;
@@ -221,13 +241,15 @@ async function main(): Promise<void> {
   }
 
   // 7. Re-index the daily log file
+  const db = initDb(DB_PATH);
   try {
-    const db = initDb(DB_PATH);
     const isGlobal = memoryDir.startsWith(path.join(os.homedir(), '.claude-memory'));
-    indexFile(db, dailyLogPath, isGlobal ? 'global' : 'project', isGlobal ? undefined : cwd);
-    db.close();
+    const projectName = isGlobal ? undefined : path.basename(cwd);
+    await indexFile(db, dailyLogPath, isGlobal ? 'global' : 'project', projectName);
   } catch (err) {
     console.error('[pre-compact] re-index failed:', (err as Error).message);
+  } finally {
+    db.close();
   }
 }
 

@@ -96,11 +96,28 @@ export function startWatcher(
       stabilityThreshold: 1500,
       pollInterval: 100,
     },
-    ignored: /[/\\]\./,       // ignore hidden files
+    ignored: (filePath: string) => {
+      const base = path.basename(filePath);
+      if (base.startsWith('.') && base !== '.claude' && base !== '.claude-memory') {
+        return true;
+      }
+      return false;
+    },
   });
 
   watcher.on('add', handleChange);
   watcher.on('change', handleChange);
+
+  // I1: Handle deleted files — remove stale chunks from the index
+  watcher.on('unlink', (filePath: string) => {
+    if (!filePath.endsWith('.md')) return;
+    try {
+      db.prepare('DELETE FROM chunks WHERE path = ?').run(filePath);
+      console.error(`[watcher] Removed index for deleted file: ${path.basename(filePath)}`);
+    } catch (err) {
+      console.error(`[watcher] Failed to remove index: ${(err as Error).message}`);
+    }
+  });
 
   async function handleChange(changedPath: string) {
     if (!changedPath.endsWith('.md')) return;
@@ -118,4 +135,29 @@ export function startWatcher(
   }
 
   console.error('[watcher] watching', watchPaths.length, 'paths');
+
+  // I20: Watch for new project directories created after startup
+  const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+  try {
+    fs.statSync(projectsRoot);
+    const rootWatcher = chokidar.watch(projectsRoot, {
+      depth: 1,
+      ignoreInitial: true,
+      persistent: false,
+    });
+
+    rootWatcher.on('addDir', (dirPath: string) => {
+      const memoryDir = path.join(dirPath, 'memory');
+      try {
+        if (fs.statSync(memoryDir).isDirectory()) {
+          watcher.add(memoryDir);
+          console.error(`[watcher] Added new project memory dir: ${dirPath}`);
+        }
+      } catch {
+        // memory/ subdir doesn't exist yet — ignore
+      }
+    });
+  } catch {
+    // .claude/projects doesn't exist — skip root watcher
+  }
 }

@@ -46,10 +46,22 @@ function isEvergreen(filePath: string): boolean {
 // MMR re-ranking helpers
 // ---------------------------------------------------------------------------
 
+// Token cache for Jaccard similarity — avoids re-tokenizing the same text in MMR loops
+const tokenCache = new Map<string, Set<string>>();
+
+function getTokens(text: string): Set<string> {
+  let tokens = tokenCache.get(text);
+  if (!tokens) {
+    tokens = new Set(text.toLowerCase().split(/\W+/).filter(Boolean));
+    tokenCache.set(text, tokens);
+  }
+  return tokens;
+}
+
 // Jaccard similarity between two strings (tokenized on non-word chars)
 function jaccardSim(a: string, b: string): number {
-  const tokA = new Set(a.toLowerCase().split(/\W+/).filter(Boolean));
-  const tokB = new Set(b.toLowerCase().split(/\W+/).filter(Boolean));
+  const tokA = getTokens(a);
+  const tokB = getTokens(b);
   if (tokA.size === 0 && tokB.size === 0) return 1;
   if (tokA.size === 0 || tokB.size === 0) return 0;
   let intersection = 0;
@@ -77,6 +89,7 @@ function mmrRerank(results: SearchResult[], limit: number, lambda = 0.7): Search
     selected.push(remaining[bestIdx]);
     remaining.splice(bestIdx, 1);
   }
+  tokenCache.clear(); // Free cached tokens after rerank completes
   return selected;
 }
 
@@ -96,23 +109,63 @@ export function search(
   // 1. BM25 via FTS5
   //    Split into individual terms (FTS5 implicit AND) — phrase quoting is too strict
   //    and returns 0 results for most natural-language queries.
+  const FTS5_RESERVED = new Set(['OR', 'AND', 'NOT', 'NEAR']);
   const ftsQuery = query
     .trim()
     .replace(/[^a-zA-Z0-9\s]/g, ' ') // strip FTS5 special chars
     .split(/\s+/)
     .filter(Boolean)
+    .filter(t => !FTS5_RESERVED.has(t.toUpperCase())) // strip FTS5 reserved words
     .join(' OR '); // OR union: vector + BM25 scoring handles ranking; AND was too strict for multi-word queries
-  const bm25Rows = db
-    .prepare(
-      'SELECT rowid, bm25(fts) as score FROM fts WHERE fts MATCH ? ORDER BY bm25(fts) LIMIT ?',
-    )
-    .all(ftsQuery, candidateCount) as BM25Row[];
+  let bm25Rows: BM25Row[] = [];
+  if (ftsQuery.length > 0) {
+    try {
+      bm25Rows = db
+        .prepare(
+          'SELECT rowid, bm25(fts) as score FROM fts WHERE fts MATCH ? ORDER BY bm25(fts) LIMIT ?',
+        )
+        .all(ftsQuery, candidateCount) as BM25Row[];
+    } catch {
+      // FTS match failed — fall through to vector fallback
+    }
+  }
 
-  if (bm25Rows.length === 0) return [];
+  if (bm25Rows.length === 0) {
+    // Vector-only fallback when FTS returns nothing
+    const allChunks = (project
+      ? db.prepare('SELECT * FROM chunks WHERE embedding IS NOT NULL AND (project = ? OR project IS NULL) ORDER BY updated_at DESC LIMIT ?').all(project, candidateCount)
+      : db.prepare('SELECT * FROM chunks WHERE embedding IS NOT NULL ORDER BY updated_at DESC LIMIT ?').all(candidateCount)
+    ) as ChunkRow[];
+
+    if (allChunks.length === 0) return [];
+
+    const now = Date.now();
+    const lambda = Math.LN2 / 30;
+
+    const vectorResults: SearchResult[] = allChunks
+      .map(chunk => {
+        const vectorScore = chunk.embedding ? cosineSimilarity(queryEmbedding, chunk.embedding) : 0;
+        const ageInDays = (now - chunk.updated_at) / 86_400_000;
+        const decay = isEvergreen(chunk.path) ? 1.0 : Math.exp(-lambda * ageInDays);
+        return {
+          id: chunk.id,
+          path: chunk.path,
+          layer: chunk.layer,
+          project: chunk.project,
+          startLine: chunk.start_line,
+          endLine: chunk.end_line,
+          text: chunk.text,
+          score: vectorScore * decay,
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    return mmrRerank(vectorResults, limit);
+  }
 
   // 2. Fetch full chunk for each BM25 hit, optionally filtering by project
   const chunkStmt = project
-    ? db.prepare('SELECT * FROM chunks WHERE rowid = ? AND project = ?')
+    ? db.prepare('SELECT * FROM chunks WHERE rowid = ? AND (project = ? OR project IS NULL)')
     : db.prepare('SELECT * FROM chunks WHERE rowid = ?');
 
   interface ScoredCandidate {
@@ -156,8 +209,9 @@ export function search(
 
   const results: SearchResult[] = candidates.map((c) => {
     // Normalised BM25: 0..1 range (1 = best match)
-    const bm25Score =
-      (c.rawBM25 - bm25Max) / (bm25Min - bm25Max + 1e-9);
+    const bm25Score = bm25Min === bm25Max
+      ? 1.0 // Single hit gets full BM25 score
+      : (c.rawBM25 - bm25Max) / (bm25Min - bm25Max);
 
     // 5. Combine: 70% vector + 30% BM25
     const rawScore = 0.7 * c.vectorScore + 0.3 * bm25Score;
