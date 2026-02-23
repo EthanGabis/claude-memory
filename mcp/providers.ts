@@ -30,6 +30,9 @@ const MODELS_DIR = path.join(os.homedir(), '.claude-memory', 'models');
 export class LocalGGUFProvider implements EmbeddingProvider {
   private context: any = null; // lazily initialised LlamaEmbeddingContext
   private initPromise: Promise<void> | null = null;
+  // Mutex: GGUF model is single-threaded — serialize embed calls to prevent
+  // concurrent access that causes "Failed to embed" errors during burst loads
+  private embedQueue: Promise<any> = Promise.resolve();
 
   private async ensureContext(): Promise<void> {
     if (this.context) return;
@@ -65,6 +68,13 @@ export class LocalGGUFProvider implements EmbeddingProvider {
   }
 
   async embed(texts: string[]): Promise<(Float32Array | null)[]> {
+    // Serialize through mutex — GGUF model can't handle concurrent calls
+    const ticket = this.embedQueue.then(() => this._doEmbed(texts));
+    this.embedQueue = ticket.catch(() => {}); // swallow rejection in chain
+    return ticket;
+  }
+
+  private async _doEmbed(texts: string[]): Promise<(Float32Array | null)[]> {
     await this.ensureContext();
     if (!this.context) {
       throw new Error('Embedding context failed to initialize');

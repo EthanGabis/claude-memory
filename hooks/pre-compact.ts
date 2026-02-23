@@ -171,22 +171,29 @@ async function main(): Promise<void> {
     // Use gpt-4o-mini to extract critical context
     try {
       const openai = new OpenAI({ apiKey });
-      const resp = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.3,
-        max_tokens: 800,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'You are a context-preservation assistant. Extract the most critical context from this session that would be lost after compaction. Focus on: current task state, key decisions made, open problems, important file paths. Output concise bullet points in Markdown.',
-          },
-          {
-            role: 'user',
-            content: transcript,
-          },
-        ],
-      });
+      let timeoutId: ReturnType<typeof setTimeout>;
+      const resp = await Promise.race([
+        openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          temperature: 0.3,
+          max_tokens: 800,
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You are a context-preservation assistant. Extract the most critical context from this session that would be lost after compaction. Focus on: current task state, key decisions made, open problems, important file paths. Output concise bullet points in Markdown.',
+            },
+            {
+              role: 'user',
+              content: transcript,
+            },
+          ],
+        }).finally(() => clearTimeout(timeoutId)),
+        new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error('OpenAI timeout after 30s')), 30_000);
+          if (typeof timeoutId === 'object' && 'unref' in timeoutId) (timeoutId as any).unref();
+        }),
+      ]);
       contextNotes = resp.choices[0]?.message?.content?.trim() ?? '';
     } catch (err) {
       console.error('[pre-compact] OpenAI call failed, falling back to plain excerpt:', (err as Error).message);

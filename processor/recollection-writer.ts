@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import type { Database } from 'bun:sqlite';
-import { packEmbedding, unpackEmbedding, cosineSimilarity } from '../mcp/embeddings.js';
+import { packEmbedding, cosineSimilarity } from '../mcp/embeddings.js';
 import type { EmbeddingProvider } from '../mcp/providers.js';
 
 // ---------------------------------------------------------------------------
@@ -72,11 +72,15 @@ export async function writeRecollections(
   previousEmbedding: Float32Array | null,
   embedProvider: EmbeddingProvider,
   db: Database,
+  force?: boolean,
 ): Promise<{ embedding: Float32Array }> {
   // 1. Embed user message locally (~5ms)
+  // Truncate to 6000 chars (~1500 tokens) — nomic-embed-text has 8192 token limit
+  // and long messages don't produce better embeddings for topic gating
+  const truncated = userMessage.length > 6000 ? userMessage.slice(0, 6000) : userMessage;
   let currentEmbedding: Float32Array | null = null;
   try {
-    const embeddings = await embedProvider.embed([userMessage]);
+    const embeddings = await embedProvider.embed([truncated]);
     currentEmbedding = embeddings[0] ?? null;
   } catch {
     currentEmbedding = null; // NOT a zero vector — would pollute cosine similarity
@@ -89,7 +93,8 @@ export async function writeRecollections(
   }
 
   // 2. Topic-change gate: cosine sim > 0.85 with previous = SKIP
-  if (previousEmbedding && previousEmbedding.some(v => v !== 0)) {
+  //    Bypassed when force=true (e.g. refreshRecollection after extraction)
+  if (!force && previousEmbedding && previousEmbedding.some(v => v !== 0)) {
     const prevBlob = packEmbedding(previousEmbedding);
     const currBlob = packEmbedding(currentEmbedding);
     const sim = cosineSimilarity(prevBlob, currBlob);
@@ -104,12 +109,22 @@ export async function writeRecollections(
 
   // BM25 search on episodes_fts
   const FTS5_RESERVED = new Set(['OR', 'AND', 'NOT', 'NEAR']);
+  const STOP_WORDS = new Set([
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'do', 'does', 'did',
+    'how', 'what', 'when', 'where', 'why', 'which', 'who', 'whom',
+    'that', 'this', 'it', 'its', 'in', 'on', 'at', 'to', 'for', 'of',
+    'with', 'by', 'from', 'as', 'but', 'if', 'so', 'than', 'then',
+    'be', 'been', 'being', 'have', 'has', 'had', 'will', 'would',
+    'could', 'should', 'may', 'can', 'just', 'about', 'also', 'very',
+    'my', 'your', 'we', 'they', 'he', 'she', 'me', 'us', 'them',
+  ]);
   const ftsQuery = userMessage
     .trim()
     .replace(/[^a-zA-Z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(Boolean)
     .filter(t => !FTS5_RESERVED.has(t.toUpperCase())) // strip FTS5 reserved words
+    .filter(t => !STOP_WORDS.has(t.toLowerCase()))    // strip common question/stop words
     .slice(0, 20) // limit terms
     .join(' OR ');
 
@@ -130,13 +145,25 @@ export async function writeRecollections(
     bm25Map.set(row.rowid, row.score);
   }
 
-  // Fetch all episodes matching scope filter (for vector search)
-  const episodes = db.prepare(
-    `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
-     FROM episodes
-     WHERE (scope = 'global' OR project = ?)
-     AND embedding IS NOT NULL`,
-  ).all(projectName) as EpisodeRow[];
+  // Fetch recent episodes matching scope filter (for vector search)
+  // When projectName is null, NULL != NULL in SQL, so only fetch global episodes
+  const episodes = projectName
+    ? db.prepare(
+        `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
+         FROM episodes
+         WHERE (scope = 'global' OR project = ?)
+         AND embedding IS NOT NULL
+         ORDER BY accessed_at DESC
+         LIMIT 200`,
+      ).all(projectName) as EpisodeRow[]
+    : db.prepare(
+        `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
+         FROM episodes
+         WHERE scope = 'global'
+         AND embedding IS NOT NULL
+         ORDER BY accessed_at DESC
+         LIMIT 200`,
+      ).all() as EpisodeRow[];
 
   if (episodes.length === 0) {
     // No episodes yet — write empty recollection
@@ -146,7 +173,6 @@ export async function writeRecollections(
 
   // 4. Score each episode: 0.5*relevance + 0.3*recency + 0.2*accessFrequency
   const now = Date.now();
-  const maxAge = 30 * 86_400_000; // 30 days for recency normalization
 
   // Find max access_count for normalization
   const maxAccess = Math.max(1, ...episodes.map(e => e.access_count));
@@ -172,7 +198,7 @@ export async function writeRecollections(
     if (bm25Map.has(episode.rowid)) {
       const rawBm25 = bm25Map.get(episode.rowid)!;
       if (bm25Min === bm25Max) {
-        normBm25 = 1.0; // Single hit gets full BM25 score
+        normBm25 = 0.5; // Single hit gets moderate score, not full
       } else {
         normBm25 = (rawBm25 - bm25Max) / (bm25Min - bm25Max);
       }
@@ -190,8 +216,8 @@ export async function writeRecollections(
     const ageMs = now - episode.created_at;
     const recency = Math.exp(-Math.LN2 / 30 * (ageMs / 86_400_000));
 
-    // Access frequency: normalized 0-1
-    const accessFreq = episode.access_count / maxAccess;
+    // Access frequency: Laplace-smoothed so new episodes aren't penalized
+    const accessFreq = (episode.access_count + 1) / (maxAccess + 1);
 
     // Final score
     const finalScore = 0.5 * relevance + 0.3 * recency + 0.2 * accessFreq;
@@ -223,6 +249,36 @@ export async function writeRecollections(
   }
 
   return { embedding: currentEmbedding };
+}
+
+// ---------------------------------------------------------------------------
+// Eager refresh — called by daemon after an extraction cycle
+// ---------------------------------------------------------------------------
+
+/**
+ * Eagerly refresh recollection for a session — called by daemon after extraction.
+ * Re-runs the recollection pipeline with the session's last user message.
+ */
+export async function refreshRecollection(
+  sessionId: string,
+  lastUserMessage: string,
+  lastMessageUuid: string,
+  projectName: string | null,
+  previousEmbedding: Float32Array | null,
+  embedProvider: EmbeddingProvider,
+  db: Database,
+): Promise<{ embedding: Float32Array }> {
+  // Re-use the main writeRecollections function — force=true bypasses topic gate
+  return writeRecollections(
+    sessionId,
+    lastUserMessage,
+    lastMessageUuid,
+    projectName,
+    previousEmbedding,
+    embedProvider,
+    db,
+    true, // force: skip topic-change gate since we just extracted new episodes
+  );
 }
 
 // ---------------------------------------------------------------------------

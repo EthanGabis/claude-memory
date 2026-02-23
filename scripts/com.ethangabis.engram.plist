@@ -6,9 +6,12 @@
     <string>com.ethangabis.engram</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>/Users/ethangabis/Desktop/Projects/claude-memory/scripts/engram-start.sh</string>
+        <string>/Users/ethangabis/.bun/bin/bun</string>
+        <string>--env-file=/Users/ethangabis/.claude-memory/.env</string>
+        <string>/Users/ethangabis/Desktop/Projects/claude-memory/processor/index.ts</string>
     </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/ethangabis</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

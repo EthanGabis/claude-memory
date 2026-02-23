@@ -46,33 +46,39 @@ function isEvergreen(filePath: string): boolean {
 // MMR re-ranking helpers
 // ---------------------------------------------------------------------------
 
-// Token cache for Jaccard similarity — avoids re-tokenizing the same text in MMR loops
-const tokenCache = new Map<string, Set<string>>();
-
-function getTokens(text: string): Set<string> {
-  let tokens = tokenCache.get(text);
-  if (!tokens) {
-    tokens = new Set(text.toLowerCase().split(/\W+/).filter(Boolean));
-    tokenCache.set(text, tokens);
-  }
-  return tokens;
-}
-
-// Jaccard similarity between two strings (tokenized on non-word chars)
-function jaccardSim(a: string, b: string): number {
-  const tokA = getTokens(a);
-  const tokB = getTokens(b);
-  if (tokA.size === 0 && tokB.size === 0) return 1;
-  if (tokA.size === 0 || tokB.size === 0) return 0;
-  let intersection = 0;
-  for (const t of tokA) if (tokB.has(t)) intersection++;
-  return intersection / (tokA.size + tokB.size - intersection);
+function createTokenCache() {
+  const cache = new Map<string, Set<string>>();
+  return {
+    get(text: string): Set<string> {
+      let tokens = cache.get(text);
+      if (!tokens) {
+        tokens = new Set(text.toLowerCase().split(/\W+/).filter(Boolean));
+        cache.set(text, tokens);
+      }
+      return tokens;
+    },
+    clear() { cache.clear(); },
+  };
 }
 
 // MMR re-ranking: lambda=0.7 matches OpenClaw default
 // Greedy selection: maximize lambda*relevance - (1-lambda)*maxSimilarityToSelected
 function mmrRerank(results: SearchResult[], limit: number, lambda = 0.7): SearchResult[] {
   if (results.length === 0) return [];
+
+  // Local token cache — scoped to this call, no cross-call leaks
+  const tokens = createTokenCache();
+
+  function jaccardSim(a: string, b: string): number {
+    const tokA = tokens.get(a);
+    const tokB = tokens.get(b);
+    if (tokA.size === 0 && tokB.size === 0) return 1;
+    if (tokA.size === 0 || tokB.size === 0) return 0;
+    let intersection = 0;
+    for (const t of tokA) if (tokB.has(t)) intersection++;
+    return intersection / (tokA.size + tokB.size - intersection);
+  }
+
   const selected: SearchResult[] = [];
   const remaining = [...results];
   while (selected.length < limit && remaining.length > 0) {
@@ -89,7 +95,6 @@ function mmrRerank(results: SearchResult[], limit: number, lambda = 0.7): Search
     selected.push(remaining[bestIdx]);
     remaining.splice(bestIdx, 1);
   }
-  tokenCache.clear(); // Free cached tokens after rerank completes
   return selected;
 }
 

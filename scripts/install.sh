@@ -46,4 +46,22 @@ bun -e "
 })();
 "
 
+# 4. Install LaunchAgent for Engram daemon
+PLIST_SRC="$SCRIPT_DIR/com.ethangabis.engram.plist"
+PLIST_DST="$HOME/Library/LaunchAgents/com.ethangabis.engram.plist"
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+
+mkdir -p "$LAUNCH_AGENTS_DIR"
+
+# Unload existing agent if loaded (ignore errors if not loaded)
+launchctl bootout "gui/$(id -u)/com.ethangabis.engram" 2>/dev/null || true
+
+# Symlink the plist (force overwrite if exists)
+ln -sf "$PLIST_SRC" "$PLIST_DST"
+echo "[claude-memory] Symlinked LaunchAgent plist to $PLIST_DST"
+
+# Load the agent
+launchctl load "$PLIST_DST"
+echo "[claude-memory] Loaded LaunchAgent com.ethangabis.engram"
+
 echo "[claude-memory] Installation complete."

@@ -16,6 +16,8 @@ import { indexFile, backfillEmbeddings } from './indexer.js';
 import { createProviderChain } from './providers.js';
 import { startWatcher, discoverProjectMemoryDirs } from './watcher.js';
 import { withFileLock } from '../shared/file-lock.js';
+import { resolveProjectFromCwd } from '../shared/project-resolver.js';
+import { SOCKET_PATH } from '../shared/uds.js';
 
 // ---------------------------------------------------------------------------
 // Startup checks
@@ -40,27 +42,13 @@ let cachedProjectMemoryDirs: string[] = [];
 const provider = createProviderChain(apiKey, db);
 
 // ---------------------------------------------------------------------------
-// Project detection — walk up from CWD looking for .claude/ directory
+// Project detection — thin adapter over shared/project-resolver.ts
 // ---------------------------------------------------------------------------
 
 function detectProject(startDir?: string): { root: string; name: string } | null {
-  let dir = startDir ?? process.cwd();
-  const root = path.parse(dir).root;
-
-  while (dir !== root) {
-    const claudeDir = path.join(dir, '.claude');
-    try {
-      const stat = fsSync.statSync(claudeDir);
-      if (stat.isDirectory()) {
-        return { root: dir, name: path.basename(dir) };
-      }
-    } catch {
-      // .claude/ not found at this level — keep walking up
-    }
-    dir = path.dirname(dir);
-  }
-
-  return null;
+  const info = resolveProjectFromCwd(startDir ?? process.cwd());
+  if (!info.name || !info.fullPath) return null;
+  return { root: info.fullPath, name: info.name };
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +206,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['id'],
       },
     },
+    {
+      name: 'memory_forget',
+      description:
+        'Delete a specific memory episode by ID. Use this to remove incorrect or outdated memories.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          id: {
+            type: 'string',
+            description: 'Episode ID to delete (from memory_recall results)',
+          },
+        },
+        required: ['id'],
+      },
+    },
+    {
+      name: 'memory_status',
+      description:
+        'Check Engram daemon health, episode counts, and system status.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {},
+      },
+    },
   ],
 }));
 
@@ -244,6 +256,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === 'memory_expand') {
     return handleMemoryExpand(args as { id: string });
+  }
+
+  if (name === 'memory_forget') {
+    return handleMemoryForget(args as { id: string });
+  }
+
+  if (name === 'memory_status') {
+    return handleMemoryStatus();
   }
 
   return {
@@ -641,7 +661,10 @@ async function handleMemoryRecall(args: {
   limit?: number;
   project?: string;
 }) {
-  const { query, limit, project } = args;
+  const { query, limit } = args;
+  // C2: Default to current project when no project arg — prevents leaking
+  // project-scoped memories from other projects in recall results
+  const project = args.project ?? detectProject()?.name ?? undefined;
   const effectiveLimit = Math.max(1, Math.min(limit ?? 5, 50));
 
   try {
@@ -749,7 +772,7 @@ async function handleMemoryRecall(args: {
       let bm25Score = 0;
       if (c.rawBM25 !== 0) {
         if (bm25Min === bm25Max) {
-          bm25Score = 1.0; // Single hit gets full BM25 score
+          bm25Score = 0.5; // Single hit gets moderate BM25 score, not full
         } else {
           bm25Score = (c.rawBM25 - bm25Max) / (bm25Min - bm25Max);
         }
@@ -762,8 +785,8 @@ async function handleMemoryRecall(args: {
       const ageInDays = (now - c.episode.created_at) / 86_400_000;
       const recency = Math.exp(-(Math.LN2 / 30) * ageInDays);
 
-      // Access frequency: normalized 0..1
-      const accessFreq = c.episode.access_count / maxAccess;
+      // Access frequency: Laplace-smoothed, normalized 0..1
+      const accessFreq = (c.episode.access_count + 1) / (maxAccess + 1);
 
       // High-importance memories get minimum relevance floor of 0.3
       const effectiveRelevance = (c.episode.importance === 'high') ? Math.max(relevance, 0.3) : relevance;
@@ -839,6 +862,23 @@ async function handleMemoryExpand(args: { id: string }) {
       };
     }
 
+    // C1: Scope/project boundary check — only allow expanding episodes
+    // that are global or belong to the current project (prevents cross-project leaks)
+    if (episode.scope === 'project' && episode.project) {
+      const currentProject = detectProject();
+      if (!currentProject || currentProject.name !== episode.project) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Cannot expand memory from project "${episode.project}" — not the current project.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
     // Update accessed_at and access_count
     const now = Date.now();
     db.prepare(
@@ -890,6 +930,216 @@ async function handleMemoryExpand(args: { id: string }) {
         {
           type: 'text' as const,
           text: `Memory expand failed: ${(err as Error).message}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tool: memory_forget
+// ---------------------------------------------------------------------------
+
+async function handleMemoryForget(args: { id: string }) {
+  const { id } = args;
+
+  try {
+    // Validate ID format
+    if (!id || !id.startsWith('ep_')) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Invalid episode ID. Must start with "ep_" (e.g. "ep_abc123").',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // W3: Check episode exists AND enforce scope/project boundary
+    const episode = db
+      .prepare('SELECT id, summary, scope, project FROM episodes WHERE id = ?')
+      .get(id) as { id: string; summary: string; scope: string; project: string | null } | undefined;
+
+    if (!episode) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `No memory found with ID: ${id}`,
+          },
+        ],
+      };
+    }
+
+    // W3 + C3: Scope/project boundary check — only allow deleting episodes
+    // that are global or belong to the current project.
+    // NOTE (C3): Comparison uses project basename only (episodes table stores basename).
+    // Two repos with identical basenames could theoretically cross-delete. A full fix
+    // requires a schema migration to store canonical project paths. Low practical risk
+    // since project names are typically unique within a user's workspace.
+    if (episode.scope === 'project' && episode.project) {
+      const currentProject = detectProject();
+      if (!currentProject || currentProject.name !== episode.project) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Cannot delete memory from project "${episode.project}" — not the current project.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    // Delete the episode — the `episodes_ad` trigger in schema.ts
+    // automatically handles FTS5 cleanup on DELETE.
+    // Do NOT manually delete from episodes_fts.
+    db.prepare('DELETE FROM episodes WHERE id = ?').run(id);
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Deleted memory: "${episode.summary}" (${id})`,
+        },
+      ],
+    };
+  } catch (err) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Memory forget failed: ${(err as Error).message}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tool: memory_status
+// ---------------------------------------------------------------------------
+
+async function handleMemoryStatus() {
+  try {
+    const memoryDir = path.join(os.homedir(), '.claude-memory');
+    const pidPath = path.join(memoryDir, 'engram.pid');
+    const recollectionsDir = path.join(memoryDir, 'recollections');
+
+    // 1. Daemon health — check PID file and process liveness
+    let daemonStatus = 'NOT RUNNING';
+    let daemonPid: number | null = null;
+    let daemonUptime: string | null = null;
+
+    try {
+      const pidStr = await fs.readFile(pidPath, 'utf-8');
+      daemonPid = parseInt(pidStr.trim(), 10);
+      if (!isNaN(daemonPid)) {
+        try {
+          process.kill(daemonPid, 0); // signal 0 = check alive
+          daemonStatus = `RUNNING (PID ${daemonPid})`;
+
+          // Calculate uptime from PID file mtime
+          const stat = await fs.stat(pidPath);
+          const uptimeMs = Date.now() - stat.mtimeMs;
+          const hours = Math.floor(uptimeMs / 3_600_000);
+          const mins = Math.floor((uptimeMs % 3_600_000) / 60_000);
+          daemonUptime = `${hours}h ${mins}m`;
+        } catch {
+          daemonStatus = `NOT RUNNING (stale PID: ${daemonPid})`;
+        }
+      }
+    } catch {
+      // PID file doesn't exist
+    }
+
+    // 1b. Check if UDS socket exists on disk
+    let socketExists = false;
+    try {
+      await fs.access(SOCKET_PATH);
+      socketExists = true;
+    } catch {}
+
+    // 2. Episode counts — total, by project, by importance
+    const totalRow = db.prepare('SELECT COUNT(*) as cnt FROM episodes').get() as { cnt: number };
+    const total = totalRow.cnt;
+
+    const byProject = db.prepare(`
+      SELECT COALESCE(project, '(global)') as proj, COUNT(*) as cnt
+      FROM episodes GROUP BY project ORDER BY cnt DESC
+    `).all() as { proj: string; cnt: number }[];
+
+    const byImportance = db.prepare(`
+      SELECT importance, COUNT(*) as cnt
+      FROM episodes GROUP BY importance ORDER BY cnt DESC
+    `).all() as { importance: string; cnt: number }[];
+
+    // 3. Chunk count
+    const chunkRow = db.prepare('SELECT COUNT(*) as cnt FROM chunks').get() as { cnt: number };
+    const chunkCount = chunkRow.cnt;
+
+    // 4. Recollections directory
+    let recollectionCount = 0;
+    try {
+      const files = await fs.readdir(recollectionsDir);
+      recollectionCount = files.filter(f => f.endsWith('.json')).length;
+    } catch {
+      // Directory may not exist
+    }
+
+    // 5. Schema version
+    let schemaVersion = 0;
+    try {
+      const row = db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get() as { value: string } | undefined;
+      if (row) schemaVersion = parseInt(row.value, 10);
+    } catch {
+      // _meta table may not exist
+    }
+
+    // 6. Format output
+    const lines: string[] = [
+      '=== Engram Status ===',
+      '',
+      `Daemon:       ${daemonStatus}`,
+    ];
+    if (daemonUptime) {
+      lines.push(`Uptime:       ${daemonUptime}`);
+    }
+    lines.push(`Socket:       ${socketExists ? 'exists' : 'NOT FOUND'} (${SOCKET_PATH})`);
+    lines.push(`Schema:       v${schemaVersion}`);
+    lines.push(`DB Path:      ${DB_PATH}`);
+    lines.push('');
+    lines.push(`Episodes:     ${total} total`);
+    if (byProject.length > 0) {
+      for (const p of byProject) {
+        lines.push(`  ${p.proj.padEnd(25)} ${p.cnt}`);
+      }
+    }
+    lines.push('');
+    lines.push('By importance:');
+    if (byImportance.length > 0) {
+      for (const i of byImportance) {
+        lines.push(`  ${i.importance.padEnd(10)} ${i.cnt}`);
+      }
+    }
+    lines.push('');
+    lines.push(`Chunks:       ${chunkCount}`);
+    lines.push(`Recollections: ${recollectionCount} active`);
+
+    return {
+      content: [{ type: 'text' as const, text: lines.join('\n') }],
+    };
+  } catch (err) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Memory status failed: ${(err as Error).message}`,
         },
       ],
       isError: true,

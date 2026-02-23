@@ -136,28 +136,18 @@ export function startWatcher(
 
   console.error('[watcher] watching', watchPaths.length, 'paths');
 
-  // I20: Watch for new project directories created after startup
-  const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
-  try {
-    fs.statSync(projectsRoot);
-    const rootWatcher = chokidar.watch(projectsRoot, {
-      depth: 1,
-      ignoreInitial: true,
-      persistent: false,
-    });
-
-    rootWatcher.on('addDir', (dirPath: string) => {
-      const memoryDir = path.join(dirPath, 'memory');
-      try {
-        if (fs.statSync(memoryDir).isDirectory()) {
-          watcher.add(memoryDir);
-          console.error(`[watcher] Added new project memory dir: ${dirPath}`);
-        }
-      } catch {
-        // memory/ subdir doesn't exist yet — ignore
+  // I20: Periodically discover new project memory directories
+  // Re-scan every 5 minutes for new projects created after MCP server startup
+  const refreshTimer = setInterval(() => {
+    const freshPaths = discoverProjectMemoryDirs();
+    for (const p of freshPaths) {
+      if (!watchPaths.includes(p)) {
+        watcher.add(p);
+        watchPaths.push(p);
+        console.error(`[watcher] Added new project memory dir: ${p}`);
       }
-    });
-  } catch {
-    // .claude/projects doesn't exist — skip root watcher
-  }
+    }
+  }, 5 * 60 * 1000);
+  // Don't let this timer prevent process exit
+  if (typeof refreshTimer === 'object' && 'unref' in refreshTimer) refreshTimer.unref();
 }

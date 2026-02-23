@@ -7,6 +7,8 @@ import { LocalGGUFProvider } from '../mcp/providers.js';
 import { StateStore } from './state.js';
 import { SessionTailer } from './session-tailer.js';
 import { runConsolidation } from './consolidator.js';
+import { createEngramServer, SOCKET_PATH } from '../shared/uds.js';
+import { resolveProjectFromJsonlPath } from '../shared/project-resolver.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -15,17 +17,22 @@ import { runConsolidation } from './consolidator.js';
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 const PID_PATH = path.join(os.homedir(), '.claude-memory', 'engram.pid');
-const MEMORY_WARN_MB = 400;
-const MEMORY_RESTART_MB = 512;
+const MEMORY_WARN_MB = 300;
+const MEMORY_RESTART_MB = 400;
 const SESSION_SCAN_INTERVAL_MS = 60_000;
 const COLD_CONSOLIDATION_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
-const MAX_FILE_AGE_DAYS = 7;
+const MAX_FILE_AGE_DAYS = 3;
+const STARTUP_MEMORY_CHECK_MS = 10_000; // check memory every 10s during startup burst
+const STARTUP_BURST_DURATION_MS = 5 * 60 * 1000; // first 5 minutes
 
 // ---------------------------------------------------------------------------
 // PID file management (atomic: O_CREAT | O_EXCL)
 // ---------------------------------------------------------------------------
 
 let pidFd: number | null = null;
+
+// W4: PID reuse protection — max age for a PID file to be considered valid
+const PID_MAX_AGE_DAYS = 30;
 
 function acquirePidFile(): boolean {
   fs.mkdirSync(path.dirname(PID_PATH), { recursive: true });
@@ -34,19 +41,38 @@ function acquirePidFile(): boolean {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
       pidFd = fs.openSync(PID_PATH, 'wx');
-      fs.writeSync(pidFd, String(process.pid));
+      // W4: Write PID and creation timestamp for PID reuse detection
+      fs.writeSync(pidFd, `${process.pid}\n${Date.now()}`);
+      fs.fsyncSync(pidFd); // Ensure PID is visible to other processes immediately
       return true;
     } catch {
       // PID file exists — check if owner is alive
       try {
-        const pidStr = fs.readFileSync(PID_PATH, 'utf-8').trim();
-        const pid = parseInt(pidStr, 10);
+        const pidContent = fs.readFileSync(PID_PATH, 'utf-8').trim();
+        const lines = pidContent.split('\n');
+        const pid = parseInt(lines[0], 10);
+        const createdAt = lines[1] ? parseInt(lines[1], 10) : 0;
         if (!isNaN(pid)) {
           try {
             process.kill(pid, 0);
-            return false; // Another instance is genuinely running
-          } catch {
-            // PID is dead — stale file
+            // W4: PID is alive, but check for PID reuse — if the file is very old,
+            // the PID likely belongs to an unrelated process
+            if (createdAt > 0 && Date.now() - createdAt > PID_MAX_AGE_DAYS * 86_400_000) {
+              console.error(`[engram] PID ${pid} alive but PID file is ${Math.round((Date.now() - createdAt) / 86_400_000)}d old — likely PID reuse, reclaiming`);
+              // Fall through to remove stale file
+            } else {
+              console.error(`[engram] Another instance is already running (PID ${pid}, age ${Math.round((Date.now() - (createdAt || Date.now())) / 1000)}s)`);
+              return false; // Another instance is genuinely running
+            }
+          } catch (killErr: any) {
+            // ESRCH = process doesn't exist → stale PID file
+            // EPERM = process exists but we can't signal it → still alive, DON'T reclaim
+            if (killErr?.code === 'EPERM') {
+              console.error(`[engram] PID ${pid} exists but EPERM — cannot reclaim`);
+              return false;
+            }
+            // PID is dead — stale file, fall through to remove
+            console.error(`[engram] PID ${pid} is dead — removing stale PID file`);
           }
         }
       } catch {
@@ -92,7 +118,7 @@ function discoverSessions(): string[] {
           const filePath = path.join(projectPath, file.name);
 
           // Exclude subagents
-          if (filePath.includes('/subagents/')) continue;
+          if (filePath.split(path.sep).includes('subagents')) continue; // N2: path-separator aware
 
           // Filter by modification time
           try {
@@ -140,6 +166,8 @@ let stateStore: StateStore;
 const tailers = new Map<string, SessionTailer>();
 let chokidarWatcher: any = null;
 let shutdownInProgress = false;
+let udsServer: ReturnType<typeof createEngramServer> | null = null;
+const RECOLLECTIONS_DIR = path.join(os.homedir(), '.claude-memory', 'recollections');
 
 async function shutdown(reason: string): Promise<void> {
   if (shutdownInProgress) return;
@@ -147,11 +175,27 @@ async function shutdown(reason: string): Promise<void> {
 
   console.error(`[engram] Shutting down (${reason})...`);
 
-  // Stop all tailers
-  for (const [id, tailer] of tailers) {
-    tailer.stop();
-  }
+  // Stop all tailers (await async stops with 10s timeout)
+  await Promise.all(
+    [...tailers.entries()].map(async ([id, tailer]) => {
+      try {
+        await Promise.race([
+          Promise.resolve(tailer.stop()),
+          new Promise(resolve => setTimeout(resolve, 10_000)),
+        ]);
+      } catch (err) {
+        console.error(`[engram] Tailer stop failed for ${path.basename(id, '.jsonl').slice(0, 8)}: ${(err as Error).message}`);
+      }
+    })
+  );
   tailers.clear();
+
+  // Close UDS server
+  if (udsServer) {
+    udsServer.close();
+    try { fs.unlinkSync(SOCKET_PATH); } catch {}
+    udsServer = null;
+  }
 
   // Stop chokidar watcher
   if (chokidarWatcher) {
@@ -180,12 +224,32 @@ async function shutdown(reason: string): Promise<void> {
   process.exit(reason === 'memory-limit' ? 1 : 0);
 }
 
+const HOT_SESSION_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
+
 function startTailer(jsonlPath: string): void {
   if (tailers.has(jsonlPath)) return;
 
   const sessionId = path.basename(jsonlPath, '.jsonl');
+
+  // Skip cold sessions that are already fully caught up — saves memory by not
+  // creating a tailer + watcher for sessions that won't receive new data
+  try {
+    const stat = fs.statSync(jsonlPath);
+    const isCold = Date.now() - stat.mtimeMs > HOT_SESSION_THRESHOLD_MS;
+    if (isCold) {
+      const state = stateStore.getSession(sessionId);
+      if (state.byteOffset >= stat.size) {
+        // Already processed and no new data expected — skip
+        return;
+      }
+    }
+  } catch {
+    // stat failed — try to start anyway
+  }
+
   const llmApiKey = process.env.OPENAI_API_KEY ?? '';
-  const tailer = new SessionTailer(jsonlPath, stateStore, embedProvider, db, llmApiKey);
+  const projectInfo = resolveProjectFromJsonlPath(jsonlPath);
+  const tailer = new SessionTailer(jsonlPath, stateStore, embedProvider, db, llmApiKey, projectInfo);
   tailers.set(jsonlPath, tailer);
 
   tailer.start().catch(err => {
@@ -224,6 +288,8 @@ async function main(): Promise<void> {
     console.error('[engram] Continuing without embeddings — recollections will be limited');
   }
 
+  console.error(`[engram] OPENAI_API_KEY: ${process.env.OPENAI_API_KEY ? 'set' : 'NOT SET'}`);
+
   // 4. Open SQLite DB (WAL mode, busy_timeout=5000 — set by initDb)
   db = initDb(DB_PATH);
   console.error('[engram] Database ready');
@@ -233,13 +299,51 @@ async function main(): Promise<void> {
   stateStore.load();
   stateStore.startPeriodicSave();
 
-  // 6. Discover active sessions
+  // 5.5. Start UDS listener for hook-to-daemon communication
+  udsServer = createEngramServer(SOCKET_PATH, async (msg) => {
+    if (msg.event === 'flush' && msg.sessionId) {
+      for (const [tailerPath, tailer] of tailers) {
+        if (path.basename(tailerPath, '.jsonl') === msg.sessionId) {
+          console.error(`[uds] Flush requested for session ${msg.sessionId.slice(0, 8)}`);
+          try {
+            await tailer.flush();
+          } catch (err: any) {
+            console.error('[uds] flush failed:', err.message);
+          }
+          break;
+        }
+      }
+    }
+  });
+  console.error('[engram] UDS listener ready');
+
+  // 6. Discover active sessions (sorted by recency — warm sessions first)
   const sessions = discoverSessions();
   console.error(`[engram] Discovered ${sessions.length} active sessions`);
 
-  for (const jsonlPath of sessions) {
-    startTailer(jsonlPath);
+  // Stagger tailer starts to avoid overwhelming embed model and API during startup burst
+  const STARTUP_BATCH_SIZE = 3;
+  const STARTUP_BATCH_DELAY_MS = 3000;
+
+  // Sort by mtime descending — recently active sessions get processed first
+  const sorted = sessions
+    .map(p => {
+      try { return { path: p, mtime: fs.statSync(p).mtimeMs }; }
+      catch { return { path: p, mtime: 0 }; }
+    })
+    .sort((a, b) => b.mtime - a.mtime)
+    .map(s => s.path);
+
+  for (let i = 0; i < sorted.length; i += STARTUP_BATCH_SIZE) {
+    const batch = sorted.slice(i, i + STARTUP_BATCH_SIZE);
+    for (const jsonlPath of batch) {
+      startTailer(jsonlPath);
+    }
+    if (i + STARTUP_BATCH_SIZE < sorted.length) {
+      await new Promise(resolve => setTimeout(resolve, STARTUP_BATCH_DELAY_MS));
+    }
   }
+  console.error(`[engram] All ${sessions.length} tailers started (staggered)`);
 
   // 7. Watch for new JSONL files with chokidar
   try {
@@ -253,7 +357,7 @@ async function main(): Promise<void> {
 
     chokidarWatcher.on('add', (filePath: string) => {
       if (!filePath.endsWith('.jsonl')) return;
-      if (filePath.includes('/subagents/')) return;
+      if (filePath.split(path.sep).includes('subagents')) return; // N2: path-separator aware
       console.error(`[engram] New session detected: ${path.basename(filePath, '.jsonl').slice(0, 8)}`);
       startTailer(filePath);
     });
@@ -265,26 +369,57 @@ async function main(): Promise<void> {
 
   // 8. Periodic tasks
   // Session scan + tailer eviction every 60s
-  setInterval(() => {
+  // W1: Overlap guard — prevents long maintenance runs from racing on tailer stop/start
+  let isScanning = false;
+  setInterval(async () => {
+    if (isScanning) return;
+    isScanning = true;
+    try {
     // Evict stale/missing tailers
+    const toEvict: string[] = [];
     for (const [tailerPath, tailer] of tailers) {
       const shortId = path.basename(tailerPath, '.jsonl').slice(0, 8);
+      let shouldEvict = false;
       try {
         const stat = fs.statSync(tailer.jsonlPath);
         if (Date.now() - stat.mtimeMs > MAX_FILE_AGE_DAYS * 86_400_000) {
           console.error(`[engram] Evicting stale tailer: ${shortId}`);
-          tailer.stop();
-          tailers.delete(tailerPath);
+          shouldEvict = true;
         }
       } catch {
         console.error(`[engram] Evicting missing tailer: ${shortId}`);
-        tailer.stop();
-        tailers.delete(tailerPath);
+        shouldEvict = true;
+      }
+
+      if (shouldEvict) {
+        toEvict.push(tailerPath);
       }
     }
 
-    // Prune stale state entries that no longer have active sessions
-    stateStore.pruneStale(MAX_FILE_AGE_DAYS);
+    // Await stops outside the iteration to avoid modifying the map during iteration
+    for (const tailerPath of toEvict) {
+      const tailer = tailers.get(tailerPath);
+      if (!tailer) continue;
+      const shortId = path.basename(tailerPath, '.jsonl').slice(0, 8);
+      console.error(`[engram] Evicting tailer: ${shortId}`);
+      try {
+        await Promise.race([
+          tailer.stop(),
+          new Promise(resolve => setTimeout(resolve, 10_000)),
+        ]);
+      } catch (err) {
+        console.error(`[engram] Eviction stop failed: ${(err as Error).message}`);
+      }
+      tailers.delete(tailerPath);
+
+      // Clean up recollection file
+      const evictedSessionId = path.basename(tailerPath, '.jsonl');
+      try { fs.unlinkSync(path.join(RECOLLECTIONS_DIR, `${evictedSessionId}.json`)); } catch {}
+    }
+
+    // W3: Pass active session IDs to prevent pruning sessions with running tailers
+    const activeSessionIds = new Set([...tailers.keys()].map(p => path.basename(p, '.jsonl')));
+    stateStore.pruneStale(MAX_FILE_AGE_DAYS, activeSessionIds);
 
     // Discover and start new sessions
     const freshSessions = discoverSessions();
@@ -293,6 +428,9 @@ async function main(): Promise<void> {
     }
     // Memory monitoring
     checkMemoryUsage();
+    } finally {
+      isScanning = false;
+    }
   }, SESSION_SCAN_INTERVAL_MS);
 
   // Cold consolidation (every 4h) — overlap-guarded
@@ -309,6 +447,15 @@ async function main(): Promise<void> {
       isConsolidating = false;
     }
   }, COLD_CONSOLIDATION_INTERVAL_MS);
+
+  // Aggressive memory monitoring during startup burst (first 5 min)
+  // The normal 60s scan interval is too slow — RSS can spike 300MB in one interval
+  const startupMemoryCheck = setInterval(() => {
+    checkMemoryUsage();
+  }, STARTUP_MEMORY_CHECK_MS);
+  setTimeout(() => {
+    clearInterval(startupMemoryCheck);
+  }, STARTUP_BURST_DURATION_MS);
 
   console.error(`[engram] Processor running (PID: ${process.pid})`);
 }
