@@ -9,7 +9,7 @@ import { SessionTailer } from './session-tailer.js';
 import { runConsolidation } from './consolidator.js';
 import { createEngramServer, SOCKET_PATH } from '../shared/uds.js';
 import { resolveProjectFromJsonlPath } from '../shared/project-resolver.js';
-import { upsertProject } from '../shared/project-describer.js';
+import { upsertProject, generateProjectDescription } from '../shared/project-describer.js';
 import { extractFilePathsFromJsonl } from '../shared/file-path-extractor.js';
 import { inferProjectFromPaths, PROJECT_MARKERS } from '../shared/project-inferrer.js';
 
@@ -279,7 +279,7 @@ let embedProvider: LocalGGUFProvider;
  * Scans JSONL files for file paths and infers the real project.
  * Runs once per startup -- safe to repeat (idempotent).
  */
-async function runStartupMigration(database: Database): Promise<void> {
+async function runStartupMigration(database: Database, openaiClient: any): Promise<void> {
   console.error('[engram] Running startup migration: re-resolving global episodes...');
 
   // Step 1: Get all session_ids that have global episodes
@@ -346,6 +346,12 @@ async function runStartupMigration(database: Database): Promise<void> {
           if (inferred.fullPath) {
             upsertProject(database, inferred.name, inferred.fullPath);
             projectsDiscovered++;
+
+            // Generate description (fire-and-forget)
+            if (openaiClient) {
+              generateProjectDescription(inferred.fullPath, inferred.name, database, openaiClient)
+                .catch(err => console.error(`[engram] Description gen failed for "${inferred.name}":`, err.message));
+            }
           }
         } catch {}
       }
@@ -365,7 +371,7 @@ async function runStartupMigration(database: Database): Promise<void> {
  * Scan CLAUDE_MEMORY_PROJECT_ROOTS for subdirectories that look like projects.
  * Upsert them into the projects table.
  */
-async function runProjectDiscovery(database: Database): Promise<void> {
+async function runProjectDiscovery(database: Database, openaiClient: any): Promise<void> {
   const roots = process.env.CLAUDE_MEMORY_PROJECT_ROOTS;
   if (!roots) return;
 
@@ -387,6 +393,12 @@ async function runProjectDiscovery(database: Database): Promise<void> {
         if (isProject) {
           upsertProject(database, entry.name, dirPath);
           discovered++;
+
+          // Generate description (fire-and-forget)
+          if (openaiClient) {
+            generateProjectDescription(dirPath, entry.name, database, openaiClient)
+              .catch(err => console.error(`[engram] Description gen failed for "${entry.name}":`, err.message));
+          }
         }
       }
     } catch {}
@@ -430,16 +442,22 @@ async function main(): Promise<void> {
   db = initDb(DB_PATH);
   console.error('[engram] Database ready');
 
+  // 4.5. Construct OpenAI client for project description generation
+  const { default: OpenAI } = await import('openai');
+  const openaiClient = process.env.OPENAI_API_KEY
+    ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+    : null;
+
   // 5. Load persistent state
   stateStore = new StateStore();
   stateStore.load();
   stateStore.startPeriodicSave();
 
   // 5.1. Startup migration: re-resolve global episodes using file-path inference
-  await runStartupMigration(db);
+  await runStartupMigration(db, openaiClient);
 
   // 5.2. Auto-discover projects from filesystem
-  await runProjectDiscovery(db);
+  await runProjectDiscovery(db, openaiClient);
 
   // 5.5. Start UDS listener for hook-to-daemon communication
   udsServer = createEngramServer(SOCKET_PATH, async (msg) => {
