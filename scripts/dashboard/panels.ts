@@ -70,8 +70,8 @@ export function renderHealth(data: DashboardData): string {
   const rss = d.rssMB ?? 0;
   const limit = d.rssLimitMB;
   let rssColor: string;
-  if (rss < 300) rssColor = 'green';
-  else if (rss <= 400) rssColor = 'yellow';
+  if (rss < 350) rssColor = 'green';
+  else if (rss <= 500) rssColor = 'yellow';
   else rssColor = 'red';
   const bar = progressBar(rss, limit, 16);
   lines.push(`RSS: {${rssColor}-fg}${rss}MB{/} / ${limit}MB [${bar}]`);

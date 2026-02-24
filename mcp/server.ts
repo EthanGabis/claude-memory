@@ -1046,6 +1046,66 @@ async function handleMemoryForget(args: { id: string }) {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: roll up child project episode counts into top-level parents
+// ---------------------------------------------------------------------------
+
+function rollUpProjectCounts(
+  database: ReturnType<typeof initDb>,
+  rows: { proj: string; cnt: number }[],
+): { proj: string; cnt: number }[] {
+  try {
+    const projects = database.prepare(
+      `SELECT name, full_path, parent_project FROM projects`
+    ).all() as { name: string; full_path: string; parent_project: string | null }[];
+
+    if (projects.length === 0) return rows;
+
+    // Build full_path → name mapping
+    const pathToName = new Map<string, string>();
+    for (const p of projects) {
+      pathToName.set(p.full_path, p.name);
+    }
+
+    // Find top-level ancestor for a given project name
+    function findTopLevel(projectName: string): string {
+      let current = projectName;
+      const visited = new Set<string>();
+      while (true) {
+        visited.add(current);
+        let parentPath: string | null = null;
+        for (const p of projects) {
+          if (p.name === current) {
+            parentPath = p.parent_project;
+            break;
+          }
+        }
+        if (!parentPath) return current;
+        const parentName = pathToName.get(parentPath);
+        if (!parentName || visited.has(parentName)) return current;
+        current = parentName;
+      }
+    }
+
+    // Accumulate counts by top-level project
+    const totals = new Map<string, number>();
+    for (const row of rows) {
+      const topLevel = row.proj === '(global)' ? '(global)' : findTopLevel(row.proj);
+      totals.set(topLevel, (totals.get(topLevel) ?? 0) + row.cnt);
+    }
+
+    // Convert back to sorted array
+    const result: { proj: string; cnt: number }[] = [];
+    for (const [proj, cnt] of totals) {
+      result.push({ proj, cnt });
+    }
+    result.sort((a, b) => b.cnt - a.cnt);
+    return result;
+  } catch {
+    return rows;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tool: memory_status
 // ---------------------------------------------------------------------------
 
@@ -1093,10 +1153,13 @@ async function handleMemoryStatus() {
     const totalRow = db.prepare('SELECT COUNT(*) as cnt FROM episodes').get() as { cnt: number };
     const total = totalRow.cnt;
 
-    const byProject = db.prepare(`
+    const byProjectRaw = db.prepare(`
       SELECT COALESCE(project, '(global)') as proj, COUNT(*) as cnt
       FROM episodes GROUP BY project ORDER BY cnt DESC
     `).all() as { proj: string; cnt: number }[];
+
+    // Roll up child project counts into top-level parent projects
+    const byProject = rollUpProjectCounts(db, byProjectRaw);
 
     const byImportance = db.prepare(`
       SELECT importance, COUNT(*) as cnt

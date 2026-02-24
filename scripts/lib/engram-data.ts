@@ -30,7 +30,7 @@ const STATE_PATH = path.join(MEMORY_DIR, 'engram-state.json');
 const RECOLLECTIONS_DIR = path.join(MEMORY_DIR, 'recollections');
 const STDERR_LOG = path.join(MEMORY_DIR, 'engram.stderr.log');
 
-const RSS_LIMIT_MB = 400; // daemon default
+const RSS_LIMIT_MB = 500; // daemon default (GGUF model ~137MB + Bun + SQLite + sessions)
 
 // ---------------------------------------------------------------------------
 // Caches
@@ -211,15 +211,79 @@ function getTotalEpisodes(database: Database): number {
 
 function getByProject(database: Database): ProjectCount[] {
   try {
+    // Get raw per-project episode counts
     const rows = database.prepare(`
       SELECT COALESCE(project, '(global)') as name, COUNT(*) as count
       FROM episodes
       GROUP BY project
       ORDER BY count DESC
     `).all() as ProjectCount[];
-    return rows;
+
+    // Try to roll up child projects into their top-level parents
+    return rollUpByFamily(database, rows);
   } catch {
     return [];
+  }
+}
+
+/**
+ * Roll up child project episode counts into their top-level parent projects.
+ * Uses the projects table parent_project column to determine hierarchy.
+ * Falls back to the original flat list if anything goes wrong.
+ */
+function rollUpByFamily(database: Database, rows: ProjectCount[]): ProjectCount[] {
+  try {
+    // Get all projects with their parent relationships
+    const projects = database.prepare(
+      `SELECT name, full_path, parent_project FROM projects`
+    ).all() as { name: string; full_path: string; parent_project: string | null }[];
+
+    if (projects.length === 0) return rows;
+
+    // Build name → parent_name mapping by resolving full_path chains
+    const pathToName = new Map<string, string>();
+    for (const p of projects) {
+      pathToName.set(p.full_path, p.name);
+    }
+
+    function findTopLevel(projectName: string): string {
+      // Walk up the parent chain to find the root
+      let current = projectName;
+      const visited = new Set<string>();
+      while (true) {
+        visited.add(current);
+        // Find the full_path for current name
+        let parentPath: string | null = null;
+        for (const p of projects) {
+          if (p.name === current) {
+            parentPath = p.parent_project;
+            break;
+          }
+        }
+        if (!parentPath) return current; // No parent = top-level
+        const parentName = pathToName.get(parentPath);
+        if (!parentName || visited.has(parentName)) return current; // Safety: cycle or unknown
+        current = parentName;
+      }
+    }
+
+    // Roll up: accumulate counts by top-level project
+    const totals = new Map<string, number>();
+    for (const row of rows) {
+      const topLevel = row.name === '(global)' ? '(global)' : findTopLevel(row.name);
+      totals.set(topLevel, (totals.get(topLevel) ?? 0) + row.count);
+    }
+
+    // Convert back to sorted array
+    const result: ProjectCount[] = [];
+    for (const [name, count] of totals) {
+      result.push({ name, count });
+    }
+    result.sort((a, b) => b.count - a.count);
+    return result;
+  } catch {
+    // If anything fails with family resolution, return original flat list
+    return rows;
   }
 }
 
