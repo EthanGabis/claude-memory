@@ -209,6 +209,18 @@ async function shutdown(reason: string): Promise<void> {
     chokidarWatcher = null;
   }
 
+  // Run consolidation on graceful shutdown (skip on memory-limit to avoid worsening OOM)
+  if (reason !== 'memory-limit' && reason !== 'fatal-error' && db) {
+    try {
+      console.error('[engram] Running shutdown consolidation...');
+      const { runConsolidation } = await import('./consolidator.js');
+      const result = await runConsolidation(db);
+      console.error(`[engram] Shutdown consolidation: ${result.graduated} graduated, ${result.compressed} compressed, ${result.promoted} promoted, ${result.demoted} demoted, ${result.removed} removed`);
+    } catch (err) {
+      console.error(`[engram] Shutdown consolidation failed: ${(err as Error).message}`);
+    }
+  }
+
   // Save state (safe to call even if not initialized — stop() checks dirty flag)
   if (stateStore) {
     stateStore.stop();
@@ -818,22 +830,22 @@ async function main(): Promise<void> {
     }
   }, SESSION_SCAN_INTERVAL_MS);
 
-  // Cold consolidation (every 4h) — overlap-guarded
+  // Cold consolidation — overlap-guarded, runs on startup + interval + shutdown
   let isConsolidating = false;
   const runConsolidationGuarded = async () => {
     if (isConsolidating) return;
     isConsolidating = true;
     try {
       const result = await runConsolidation(db, openaiClient, embedProvider);
-      console.error(`[engram] Cold consolidation: ${result.graduated} graduated, ${result.compressed} compressed, ${result.promoted} promoted, ${result.demoted} demoted, ${result.removed} removed`);
+      console.error(`[engram] Consolidation: ${result.graduated} graduated, ${result.compressed} compressed, ${result.promoted} promoted, ${result.demoted} demoted, ${result.removed} removed`);
     } catch (err) {
-      console.error(`[engram] Cold consolidation failed: ${(err as Error).message}`);
+      console.error(`[engram] Consolidation failed: ${(err as Error).message}`);
     } finally {
       isConsolidating = false;
     }
   };
-  // Run first consolidation 60 seconds after startup so short-lived sessions still consolidate
-  setTimeout(runConsolidationGuarded, 60_000);
+  // Run immediately on startup (setTimeout 0 to not block the event loop)
+  setTimeout(runConsolidationGuarded, 0);
   setInterval(runConsolidationGuarded, COLD_CONSOLIDATION_INTERVAL_MS);
 
   // Aggressive memory monitoring during startup burst (first 5 min)
