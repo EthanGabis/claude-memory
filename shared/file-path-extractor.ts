@@ -1,6 +1,35 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+/**
+ * Extract absolute file paths from raw text content (e.g. observed session blocks).
+ * Handles JSON-like key-value patterns and standalone /Users/ paths.
+ */
+export function extractFilePathsFromText(text: string): string[] {
+  const paths = new Set<string>();
+
+  // Pattern 1: JSON key-value pairs like "file_path":"/Users/foo/bar.ts"
+  const jsonKeyRegex = /"(?:file_path|path|file|notebook_path)"\s*:\s*"(\/[^"]+)"/g;
+  let match: RegExpExecArray | null;
+  while ((match = jsonKeyRegex.exec(text)) !== null) {
+    const p = match[1];
+    if (path.isAbsolute(p)) {
+      paths.add(p);
+    }
+  }
+
+  // Pattern 2: Fallback — any absolute path starting with /Users/
+  const absolutePathRegex = /\/Users\/[^\s"',}\]\)]+/g;
+  while ((match = absolutePathRegex.exec(text)) !== null) {
+    const cleaned = match[0].replace(/[.:;]+$/, '');
+    if (path.isAbsolute(cleaned)) {
+      paths.add(cleaned);
+    }
+  }
+
+  return [...paths];
+}
+
 const FILE_PATH_TOOLS = new Set(['Read', 'Edit', 'Write']);
 const DIR_PATH_TOOLS = new Set(['Grep']);
 const GLOB_TOOL = 'Glob';
@@ -66,14 +95,14 @@ export function extractFilePathsFromEntry(entry: any): string[] {
  * Extract file paths from a JSONL file (including file-history-snapshot on line 1).
  * Reads synchronously for use in resolver (which is sync).
  */
-export function extractFilePathsFromJsonl(jsonlPath: string, maxLines: number = 200): string[] {
+export function extractFilePathsFromJsonl(jsonlPath: string, maxLines: number = 200, maxBytes: number = 512 * 1024): string[] {
   const allPaths = new Set<string>();
 
   let fd: number | null = null;
   try {
     fd = fs.openSync(jsonlPath, 'r');
     const CHUNK_SIZE = 16384;
-    const MAX_BYTES = 512 * 1024; // 512KB cap
+    const MAX_BYTES = maxBytes;
     let accumulated = '';
     let offset = 0;
     let linesScanned = 0;
@@ -114,6 +143,15 @@ export function extractFilePathsFromJsonl(jsonlPath: string, maxLines: number = 
           for (const p of extracted) {
             allPaths.add(p);
           }
+
+          // Fallback: scan raw text for file paths (observer sessions embed
+          // tool_use as plain text in <observed_from_primary_session> blocks)
+          if (extracted.length === 0) {
+            const textPaths = extractFilePathsFromText(line);
+            for (const p of textPaths) {
+              allPaths.add(p);
+            }
+          }
         } catch {
           // Malformed line -- skip
         }
@@ -125,6 +163,78 @@ export function extractFilePathsFromJsonl(jsonlPath: string, maxLines: number = 
     if (fd !== null) {
       try { fs.closeSync(fd); } catch {}
     }
+  }
+
+  return [...allPaths];
+}
+
+const MAX_SUBAGENT_FILES = 10;
+
+/**
+ * Extract file paths from a full session: the main JSONL plus any subagent JSONLs.
+ *
+ * Lead/orchestrator sessions delegate file work to subagents whose Read/Edit/Write
+ * calls live in separate JSONL files under `<sessionId>/subagents/*.jsonl`.
+ *
+ * This function:
+ * 1. Scans the main session JSONL via extractFilePathsFromJsonl
+ * 2. Checks for a sibling directory named after the session ID
+ * 3. If found, scans subagents/*.jsonl files inside it (capped at 10 files)
+ * 4. Returns a deduplicated merged array of all discovered paths
+ *
+ * Intended for migration/cold paths only — not the live resolver hot path.
+ */
+export function extractFilePathsFromSession(jsonlPath: string, maxLines?: number, maxBytes: number = 5 * 1024 * 1024): string[] {
+  const allPaths = new Set<string>();
+
+  // 1. Scan the main session JSONL (with higher byte cap for cold migration)
+  const mainPaths = extractFilePathsFromJsonl(jsonlPath, maxLines, maxBytes);
+  for (const p of mainPaths) {
+    allPaths.add(p);
+  }
+
+  // 2. Derive the sibling directory path from the JSONL filename
+  //    e.g. /path/to/f9a1016c-61b9-41b7-bb58-f080309f0223.jsonl
+  //      -> /path/to/f9a1016c-61b9-41b7-bb58-f080309f0223/
+  const dir = path.dirname(jsonlPath);
+  const basename = path.basename(jsonlPath, '.jsonl');
+  const sessionDir = path.join(dir, basename);
+
+  // 3. Check if the session directory and subagents subdirectory exist
+  const subagentsDir = path.join(sessionDir, 'subagents');
+  try {
+    const stat = fs.statSync(subagentsDir);
+    if (!stat.isDirectory()) return [...allPaths];
+  } catch {
+    // Directory doesn't exist — no subagents to scan
+    return [...allPaths];
+  }
+
+  // 4. Read subagent JSONL files, capped at MAX_SUBAGENT_FILES
+  try {
+    const entries = fs.readdirSync(subagentsDir);
+    let scanned = 0;
+
+    for (const entry of entries) {
+      if (scanned >= MAX_SUBAGENT_FILES) break;
+      if (!entry.endsWith('.jsonl')) continue;
+
+      const subagentPath = path.join(subagentsDir, entry);
+      try {
+        const stat = fs.statSync(subagentPath);
+        if (!stat.isFile()) continue;
+      } catch {
+        continue;
+      }
+
+      const subPaths = extractFilePathsFromJsonl(subagentPath, maxLines, maxBytes);
+      for (const p of subPaths) {
+        allPaths.add(p);
+      }
+      scanned++;
+    }
+  } catch {
+    // readdir error — return whatever we have
   }
 
   return [...allPaths];

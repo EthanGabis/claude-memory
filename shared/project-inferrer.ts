@@ -79,7 +79,7 @@ function isProjectRoot(dir: string): boolean {
  * Finds the longest common directory prefix, then walks up looking for project markers.
  * Returns null if no project can be inferred (e.g., paths span multiple unrelated trees).
  */
-export function inferProjectFromPaths(filePaths: string[]): ProjectInfo | null {
+export function inferProjectFromPaths(filePaths: string[], threshold: number = 0.6): ProjectInfo | null {
   // Filter to absolute paths and normalize
   const absolute = filePaths.filter(p => path.isAbsolute(p)).map(p => path.resolve(p));
   if (absolute.length < 2) return null; // not enough signal
@@ -128,8 +128,8 @@ export function inferProjectFromPaths(filePaths: string[]): ProjectInfo | null {
     }
   }
 
-  // Require supermajority: more than 60% of paths should point to this project
-  if (bestCount < absolute.length * 0.6) return null;
+  // Require majority: threshold% of paths should point to this project
+  if (bestCount < absolute.length * threshold) return null;
 
   return {
     name: path.basename(bestRoot),

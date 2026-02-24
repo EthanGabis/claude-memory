@@ -10,7 +10,7 @@ import { runConsolidation } from './consolidator.js';
 import { createEngramServer, SOCKET_PATH } from '../shared/uds.js';
 import { resolveProjectFromJsonlPath } from '../shared/project-resolver.js';
 import { upsertProject, generateProjectDescription } from '../shared/project-describer.js';
-import { extractFilePathsFromJsonl } from '../shared/file-path-extractor.js';
+import { extractFilePathsFromJsonl, extractFilePathsFromSession } from '../shared/file-path-extractor.js';
 import { inferProjectFromPaths, PROJECT_MARKERS } from '../shared/project-inferrer.js';
 
 // ---------------------------------------------------------------------------
@@ -332,10 +332,10 @@ async function runStartupMigration(database: Database, openaiClient: any): Promi
         if (!jsonlPath) continue;
 
         try {
-          const filePaths = extractFilePathsFromJsonl(jsonlPath, 200);
+          const filePaths = extractFilePathsFromSession(jsonlPath, 10000);
           if (filePaths.length < 2) continue;
 
-          const inferred = inferProjectFromPaths(filePaths);
+          const inferred = inferProjectFromPaths(filePaths, 0.4);
           if (!inferred || !inferred.name || inferred.isRoot) continue;
 
           const result = updateStmt.run(inferred.name, session_id);
