@@ -9,6 +9,7 @@ const CONNECTION_TIMEOUT = 10_000; // 10s idle timeout per server connection
 const MAX_DATA_BYTES = 64 * 1024; // 64KB data limit per server connection
 
 /**
+ * @deprecated Use Bun.serve({ unix }) in processor/index.ts instead.
  * UDS Server -- used by the Engram daemon.
  * Listens on socketPath, reads one JSON line per connection, calls handler.
  */
@@ -86,6 +87,7 @@ export function createEngramServer(
 }
 
 /**
+ * @deprecated Use sendFlushRequest() or sendRecollectRequest() instead.
  * UDS Client -- used by hooks (e.g. stop hook).
  * Connects to socketPath, writes a JSON message, disconnects.
  * Returns true on success, false if daemon is not running (ECONNREFUSED).
@@ -129,6 +131,57 @@ export async function sendEngramMessage(
       settle(false);
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// HTTP-over-UDS client functions (new — used by hooks)
+// ---------------------------------------------------------------------------
+
+/**
+ * Send a recollection request to the daemon via HTTP-over-UDS.
+ * Returns parsed JSON response on success, null on any failure.
+ */
+export async function sendRecollectRequest(
+  socketPath: string,
+  body: { prompt: string; sessionId: string },
+  timeoutMs = 240,
+): Promise<{ bites: any[]; timestamp: number } | null> {
+  try {
+    const resp = await fetch('http://localhost/recollect', {
+      unix: socketPath,
+      method: 'POST',
+      body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs),
+    } as any);
+    if (!resp.ok) return null;
+    return await resp.json() as { bites: any[]; timestamp: number };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Send a flush request to the daemon via HTTP-over-UDS.
+ * Returns true on success, false on failure.
+ */
+export async function sendFlushRequest(
+  socketPath: string,
+  sessionId: string,
+  timeoutMs = 2000,
+): Promise<boolean> {
+  try {
+    const resp = await fetch('http://localhost/flush', {
+      unix: socketPath,
+      method: 'POST',
+      body: JSON.stringify({ sessionId }),
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs),
+    } as any);
+    return resp.ok;
+  } catch {
+    return false;
+  }
 }
 
 export { SOCKET_PATH };

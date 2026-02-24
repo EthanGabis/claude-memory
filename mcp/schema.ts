@@ -449,6 +449,57 @@ export function initDb(dbPath: string): Database {
     }
   }
 
+  // --- Schema version 8 migration: add accessed_at index for vector pool query ---
+  const v8Row = db.query<{ value: string }, []>(
+    `SELECT value FROM _meta WHERE key = 'schema_version'`
+  ).get();
+  const v8Version = v8Row ? parseInt(v8Row.value, 10) : 1;
+
+  if (v8Version < 8) {
+    const runV8Migration = () => {
+      db.exec(`BEGIN EXCLUSIVE`);
+      try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_episodes_accessed_at ON episodes(accessed_at DESC) WHERE embedding IS NOT NULL`);
+        db.exec(`UPDATE _meta SET value = '8' WHERE key = 'schema_version'`);
+        db.exec(`COMMIT`);
+      } catch (err) {
+        try { db.exec(`ROLLBACK`); } catch {}
+        if ((err as Error).message?.includes('already exists')) {
+          // Index exists from a partial prior migration — just bump version
+          db.exec(`BEGIN EXCLUSIVE`);
+          try {
+            db.exec(`UPDATE _meta SET value = '8' WHERE key = 'schema_version'`);
+            db.exec(`COMMIT`);
+          } catch (innerErr) {
+            try { db.exec(`ROLLBACK`); } catch {}
+            throw innerErr;
+          }
+        } else {
+          throw err;
+        }
+      }
+    };
+
+    try {
+      runV8Migration();
+    } catch (err) {
+      if ((err as Error).message?.includes('SQLITE_BUSY') || (err as Error).message?.includes('database is locked')) {
+        console.error('[schema] v8 migration busy — retrying in 6s');
+        Bun.sleepSync(6000);
+        const recheck = db.query<{ value: string }, []>(
+          `SELECT value FROM _meta WHERE key = 'schema_version'`
+        ).get();
+        if (recheck && parseInt(recheck.value, 10) >= 8) {
+          console.error('[schema] v8 migration completed by other process');
+        } else {
+          runV8Migration();
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
   return db;
 }
 

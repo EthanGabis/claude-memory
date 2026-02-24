@@ -6,7 +6,7 @@ import type { Database } from 'bun:sqlite';
 import type { EmbeddingProvider } from '../mcp/providers.js';
 import type { StateStore } from './state.js';
 import { extractMemories, upsertEpisode, fetchEpisodeSnapshot, batchEmbedCandidates, type UpsertResult } from './extractor.js';
-import { writeRecollections, refreshRecollection } from './recollection-writer.js';
+import { refreshRecollection } from './recollection-writer.js';
 import { type ProjectInfo } from '../shared/project-resolver.js';
 import { extractFilePathsFromEntry } from '../shared/file-path-extractor.js';
 import { inferProjectFromPaths } from '../shared/project-inferrer.js';
@@ -74,14 +74,14 @@ export class SessionTailer {
   private stateStore: StateStore;
   private embedProvider: EmbeddingProvider;
   private db: Database;
-  private projectName: string | null;
-  private projectPath: string | null;
+  public projectName: string | null;
+  public projectPath: string | null;
   private projectIsRoot: boolean;
   private llmApiKey: string;
 
   private buffer: BufferedMessage[] = [];
   private extractionBuffer: BufferedMessage[] = [];
-  private previousEmbedding: Float32Array | null = null;
+  public previousEmbedding: Float32Array | null = null;
   private watcher: fs.FSWatcher | null = null;
   private processing = false;
   private pendingRead = false;
@@ -340,26 +340,9 @@ export class SessionTailer {
       lastBufferSummary: content.slice(0, 200),
     });
 
-    // On new user message: trigger recollection + check warm triggers
+    // On new user message: check warm triggers
+    // Recollection now triggered by /recollect HTTP endpoint — see userpromptsubmit hook
     if (role === 'user') {
-      // Skip recollection during initial backlog catch-up (caughtUp = false)
-      if (this.caughtUp) {
-        try {
-          const result = await writeRecollections(
-            this.sessionId,
-            content,
-            msg.uuid,
-            this.projectName,
-            this.previousEmbedding,
-            this.embedProvider,
-            this.db,
-          );
-          this.previousEmbedding = result.embedding;
-        } catch (err) {
-          console.error(`[tailer:${this.sessionId.slice(0, 8)}] Recollection error: ${(err as Error).message}`);
-        }
-      }
-
       // Update state
       const state = this.stateStore.getSession(this.sessionId);
       this.stateStore.updateSession(this.sessionId, {

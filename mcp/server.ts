@@ -664,9 +664,8 @@ async function handleMemoryRecall(args: {
   project?: string;
 }) {
   const { query, limit } = args;
-  // C2: Default to current project when no project arg — prevents leaking
-  // project-scoped memories from other projects in recall results
-  const project = args.project ?? detectProject()?.name ?? undefined;
+  // Search all projects by default — only filter when user explicitly provides project
+  const project = args.project ?? undefined;
   const effectiveLimit = Math.max(1, Math.min(limit ?? 5, 50));
 
   try {
@@ -865,34 +864,10 @@ async function handleMemoryExpand(args: { id: string }) {
       };
     }
 
-    // C1: Scope/project boundary check — only allow expanding episodes
-    // that are global or belong to the current project family (prevents cross-project leaks)
-    if (episode.scope === 'project' && episode.project) {
-      const currentProject = detectProject();
-      if (!currentProject) {
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Cannot expand memory from project "${episode.project}" — not the current project.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-      const familyPaths = getProjectFamilyPaths(db, currentProject.name);
-      if (!familyPaths.includes(episode.project_path ?? '')) {
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Cannot expand memory from project "${episode.project}" — not in the current project family.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
+    // Detect if this episode is from a different project than current
+    const currentProject = detectProject();
+    const isCrossProject = episode.scope === 'project' && episode.project &&
+      (!currentProject || episode.project !== currentProject.name);
 
     // Update accessed_at and access_count
     const now = Date.now();
@@ -922,7 +897,11 @@ async function handleMemoryExpand(args: { id: string }) {
     });
 
     // Format output
-    const output = [
+    const outputLines = [];
+    if (isCrossProject) {
+      outputLines.push(`[From project: ${episode.project}]\n`);
+    }
+    outputLines.push(
       `## Memory: ${episode.summary}`,
       `**Date:** ${dateStr}`,
       `**Project:** ${episode.project || 'Global'}`,
@@ -934,7 +913,8 @@ async function handleMemoryExpand(args: { id: string }) {
       episode.full_content || '(No additional context available)',
       '',
       `**Related Entities:** ${entitiesStr}`,
-    ].join('\n');
+    );
+    const output = outputLines.join('\n');
 
     return {
       content: [{ type: 'text' as const, text: output }],
@@ -973,7 +953,7 @@ async function handleMemoryForget(args: { id: string }) {
       };
     }
 
-    // W3: Check episode exists AND enforce scope/project boundary
+    // Check episode exists
     const episode = db
       .prepare('SELECT id, summary, scope, project, project_path FROM episodes WHERE id = ?')
       .get(id) as { id: string; summary: string; scope: string; project: string | null; project_path: string | null } | undefined;
@@ -989,46 +969,26 @@ async function handleMemoryForget(args: { id: string }) {
       };
     }
 
-    // W3 + C3: Scope/project boundary check — only allow deleting episodes
-    // that are global or belong to the current project family.
-    // Uses project_path for disambiguation (schema v7+).
-    if (episode.scope === 'project' && episode.project) {
-      const currentProject = detectProject();
-      if (!currentProject) {
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Cannot delete memory from project "${episode.project}" — not the current project.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-      const familyPaths = getProjectFamilyPaths(db, currentProject.name);
-      if (!familyPaths.includes(episode.project_path ?? '')) {
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Cannot delete memory from project "${episode.project}" — not in the current project family.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
+    // Detect if this episode is from a different project than current
+    const currentProject = detectProject();
+    const isCrossProject = episode.scope === 'project' && episode.project &&
+      (!currentProject || episode.project !== currentProject.name);
 
     // Delete the episode — the `episodes_ad` trigger in schema.ts
     // automatically handles FTS5 cleanup on DELETE.
     // Do NOT manually delete from episodes_fts.
     db.prepare('DELETE FROM episodes WHERE id = ?').run(id);
 
+    // Include cross-project attribution in delete confirmation
+    const responseText = isCrossProject
+      ? `Deleted memory from project '${episode.project}': ${episode.summary}`
+      : `Deleted memory: "${episode.summary}" (${id})`;
+
     return {
       content: [
         {
           type: 'text' as const,
-          text: `Deleted memory: "${episode.summary}" (${id})`,
+          text: responseText,
         },
       ],
     };

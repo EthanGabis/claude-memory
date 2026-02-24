@@ -4,7 +4,7 @@ import os from 'node:os';
 import OpenAI from 'openai';
 import { initDb, DB_PATH } from '../mcp/schema.js';
 import { indexFile } from '../mcp/indexer.js';
-import { sendEngramMessage, SOCKET_PATH } from '../shared/uds.js';
+import { sendFlushRequest, SOCKET_PATH } from '../shared/uds.js';
 
 // ---------------------------------------------------------------------------
 // Stop-nudge constants
@@ -312,14 +312,11 @@ async function main() {
   const entry = formatEntry(summary);
   fs.appendFileSync(dailyLogPath, entry + '\n');
 
-  // 4.5. Send flush signal to Engram daemon via UDS
-  // Fire-and-forget: the stop hook sends the message and continues.
+  // 4.5. Send flush signal to Engram daemon via HTTP-over-UDS
+  // Fire-and-forget: the stop hook sends the request and continues.
   // The daemon processes it asynchronously — JSONL persists after session end.
   if (sessionId) {
-    const flushed = await sendEngramMessage(SOCKET_PATH, {
-      event: 'flush',
-      sessionId,
-    });
+    const flushed = await sendFlushRequest(SOCKET_PATH, sessionId);
     if (flushed) {
       console.error('[stop-hook] Sent flush signal to daemon');
     }

@@ -4,7 +4,6 @@ import os from 'node:os';
 import type { Database } from 'bun:sqlite';
 import { packEmbedding, cosineSimilarity } from '../mcp/embeddings.js';
 import type { EmbeddingProvider } from '../mcp/providers.js';
-import { getProjectFamilyPaths, sqlInPlaceholders } from '../shared/project-family.js';
 
 // ---------------------------------------------------------------------------
 // Configurable topic-change threshold
@@ -146,105 +145,174 @@ export async function writeRecollections(
     bm25Map.set(row.rowid, row.score);
   }
 
-  // Fetch recent episodes matching scope filter (for vector search)
-  // When projectName is null, NULL != NULL in SQL, so only fetch global episodes
-  let episodes: EpisodeRow[];
-  if (!projectName) {
-    episodes = db.prepare(
-      `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
-       FROM episodes
-       WHERE scope = 'global'
-       AND embedding IS NOT NULL
-       ORDER BY accessed_at DESC
-       LIMIT 200`,
-    ).all() as EpisodeRow[];
-  } else {
-    const familyPaths = getProjectFamilyPaths(db, projectName);
-    if (familyPaths.length === 0) {
-      // Fallback: unknown project — filter by project name for backward compat
-      episodes = db.prepare(
-        `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
-         FROM episodes
-         WHERE (scope = 'global' OR project = ?)
-         AND embedding IS NOT NULL
-         ORDER BY accessed_at DESC
-         LIMIT 200`,
-      ).all(projectName) as EpisodeRow[];
-    } else {
-      const placeholders = sqlInPlaceholders(familyPaths);
-      episodes = db.prepare(
-        `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
-         FROM episodes
-         WHERE (scope = 'global' OR project_path IN (${placeholders}))
-         AND embedding IS NOT NULL
-         ORDER BY accessed_at DESC
-         LIMIT 200`,
-      ).all(...familyPaths) as EpisodeRow[];
-    }
-  }
+  // Fetch recent episodes across ALL projects — recollections should surface
+  // the most relevant memories regardless of project boundaries
+  const vectorPool: EpisodeRow[] = db.prepare(
+    `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
+     FROM episodes
+     WHERE embedding IS NOT NULL
+     ORDER BY accessed_at DESC
+     LIMIT 200`,
+  ).all() as EpisodeRow[];
 
-  if (episodes.length === 0) {
+  if (vectorPool.length === 0) {
     // No episodes yet — write empty recollection
     writeRecollectionFile(sessionId, userMessageUuid, []);
     return { embedding: currentEmbedding };
   }
 
-  // 4. Score each episode: 0.5*relevance + 0.3*recency + 0.2*accessFrequency
+  // Collect rowids from vector pool into a Set for fast lookup
+  const vectorPoolRowids = new Set<number>(vectorPool.map(e => e.rowid));
+
+  // Find BM25 hits not already in the vector pool — these are old/rare episodes
+  // that keyword-match but weren't in the 200 most-recently-accessed
+  const missingRowids = Array.from(bm25Map.keys()).filter(rid => !vectorPoolRowids.has(rid));
+
+  let bm25Misses: EpisodeRow[] = [];
+  if (missingRowids.length > 0) {
+    const placeholders = missingRowids.map(() => '?').join(',');
+    bm25Misses = db.prepare(
+      `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
+       FROM episodes
+       WHERE rowid IN (${placeholders}) AND embedding IS NOT NULL`,
+    ).all(...missingRowids) as EpisodeRow[];
+  }
+
+  // Unified candidate set: vector pool + BM25 misses (already deduped — misses filtered above)
+  const candidates: EpisodeRow[] = [...vectorPool, ...bm25Misses];
+
   const now = Date.now();
 
-  // Find max access_count for normalization
-  const maxAccess = Math.max(1, ...episodes.map(e => e.access_count));
+  // 4. RRF scoring: Reciprocal Rank Fusion across BM25, vector, recency, access frequency
+  //    K=60 (Cormack et al. 2009 standard), weights are relative multipliers
+  const K = 60;
+  const W_BM25 = 0.4;    // keyword relevance — calibrated to ~0.4:1.0 vs vector, matching old hybrid ratio (BM25 was ~15% vs vector ~35%)
+  const W_VECTOR = 1.0;  // semantic relevance
+  const W_RECENCY = 0.6; // temporal signal
+  const W_ACCESS = 0.4;  // usage frequency signal
 
+  // Pre-compute pass: O(N) — compute vectorSim and bm25Score once per candidate
+  // IMPORTANT: pre-compute before sort to avoid O(N log N) cosineSimilarity calls inside comparators
+  interface CandidateScores {
+    vectorSim: number;
+    bm25Score: number | null; // null = no BM25 hit
+  }
+
+  const precomputed = new Map<number, CandidateScores>();
+  for (const ep of candidates) {
+    const vectorSim = ep.embedding !== null
+      ? cosineSimilarity(queryBlob, ep.embedding as Buffer)
+      : 0;
+    const bm25Score = bm25Map.has(ep.rowid) ? bm25Map.get(ep.rowid)! : null;
+    precomputed.set(ep.rowid, { vectorSim, bm25Score });
+  }
+
+  // Build 4 rank lists using pre-computed values — 1-based dense ranking (ties share the same rank)
+  // BM25 rank list: only candidates with BM25 hits, ascending score (more negative = better in FTS5)
+  const bm25Candidates = candidates.filter(ep => precomputed.get(ep.rowid)!.bm25Score !== null);
+  bm25Candidates.sort((a, b) => precomputed.get(a.rowid)!.bm25Score! - precomputed.get(b.rowid)!.bm25Score!);
+  const bm25RankMap = new Map<number, number>();
+  { let rank = 1;
+    for (let i = 0; i < bm25Candidates.length; i++) {
+      if (i > 0 && precomputed.get(bm25Candidates[i].rowid)!.bm25Score! === precomputed.get(bm25Candidates[i - 1].rowid)!.bm25Score!) {
+        bm25RankMap.set(bm25Candidates[i].rowid, bm25RankMap.get(bm25Candidates[i - 1].rowid)!);
+      } else {
+        bm25RankMap.set(bm25Candidates[i].rowid, rank);
+      }
+      rank++;
+    }
+  }
+
+  // Vector rank list: all candidates, descending vectorSim (rank 1 = most similar)
+  const vectorSorted = [...candidates].sort(
+    (a, b) => precomputed.get(b.rowid)!.vectorSim - precomputed.get(a.rowid)!.vectorSim,
+  );
+  const vectorRankMap = new Map<number, number>();
+  { let rank = 1;
+    for (let i = 0; i < vectorSorted.length; i++) {
+      if (i > 0 && precomputed.get(vectorSorted[i].rowid)!.vectorSim === precomputed.get(vectorSorted[i - 1].rowid)!.vectorSim) {
+        vectorRankMap.set(vectorSorted[i].rowid, vectorRankMap.get(vectorSorted[i - 1].rowid)!);
+      } else {
+        vectorRankMap.set(vectorSorted[i].rowid, rank);
+      }
+      rank++;
+    }
+  }
+
+  // Recency rank list: all candidates, descending created_at (rank 1 = most recent)
+  const recencySorted = [...candidates].sort((a, b) => b.created_at - a.created_at);
+  const recencyRankMap = new Map<number, number>();
+  { let rank = 1;
+    for (let i = 0; i < recencySorted.length; i++) {
+      if (i > 0 && recencySorted[i].created_at === recencySorted[i - 1].created_at) {
+        recencyRankMap.set(recencySorted[i].rowid, recencyRankMap.get(recencySorted[i - 1].rowid)!);
+      } else {
+        recencyRankMap.set(recencySorted[i].rowid, rank);
+      }
+      rank++;
+    }
+  }
+
+  // Access frequency rank list: all candidates, descending access_count (rank 1 = most accessed)
+  const accessSorted = [...candidates].sort((a, b) => b.access_count - a.access_count);
+  const accessRankMap = new Map<number, number>();
+  { let rank = 1;
+    for (let i = 0; i < accessSorted.length; i++) {
+      if (i > 0 && accessSorted[i].access_count === accessSorted[i - 1].access_count) {
+        accessRankMap.set(accessSorted[i].rowid, accessRankMap.get(accessSorted[i - 1].rowid)!);
+      } else {
+        accessRankMap.set(accessSorted[i].rowid, rank);
+      }
+      rank++;
+    }
+  }
+
+  // RRF fusion: compute final score per candidate
   interface ScoredEpisode {
     episode: EpisodeRow;
     finalScore: number;
   }
 
   const scored: ScoredEpisode[] = [];
+  const hasBm25Hits = bm25Map.size > 0; // skip BM25 term entirely if no FTS hits
 
-  // Min-max normalize BM25 scores
-  const bm25Scores = Array.from(bm25Map.values());
-  const bm25Min = bm25Scores.length > 0 ? Math.min(...bm25Scores) : 0;
-  const bm25Max = bm25Scores.length > 0 ? Math.max(...bm25Scores) : 0;
+  for (const ep of candidates) {
+    let rrfScore = 0;
 
-  for (const episode of episodes) {
-    // Vector similarity
-    const vectorSim = cosineSimilarity(queryBlob, episode.embedding as Buffer);
-
-    // BM25 score (normalized) — only episodes with a BM25 hit participate
-    let normBm25 = 0;
-    if (bm25Map.has(episode.rowid)) {
-      const rawBm25 = bm25Map.get(episode.rowid)!;
-      if (bm25Min === bm25Max) {
-        normBm25 = 0.5; // Single hit gets moderate score, not full
-      } else {
-        normBm25 = (rawBm25 - bm25Max) / (bm25Min - bm25Max);
+    // BM25 contribution: only if this candidate has a BM25 hit AND there were FTS hits
+    if (hasBm25Hits) {
+      const bm25Rank = bm25RankMap.get(ep.rowid);
+      if (bm25Rank !== undefined) {
+        rrfScore += W_BM25 / (K + bm25Rank);
       }
+      // Candidates without a BM25 hit contribute 0 to BM25 term (not worst-rank)
     }
 
-    // Combined relevance: 70% vector + 30% BM25
-    let relevance = 0.7 * vectorSim + 0.3 * normBm25;
+    // Vector, recency, access always contribute
+    rrfScore += W_VECTOR / (K + vectorRankMap.get(ep.rowid)!);
+    rrfScore += W_RECENCY / (K + recencyRankMap.get(ep.rowid)!);
+    rrfScore += W_ACCESS / (K + accessRankMap.get(ep.rowid)!);
 
-    // High-importance floor: minimum relevance of 0.3
-    if (episode.importance === 'high' && relevance < 0.3) {
-      relevance = 0.3;
+    // High-importance boost: additive bonus ~equivalent to 10 rank positions (~0.0023 at K=60)
+    if (ep.importance === 'high') {
+      rrfScore += 1.0 / (K + 1) - 1.0 / (K + 11);
     }
 
-    // Recency: exponential decay (30-day half-life)
-    const ageMs = now - episode.created_at;
-    const recency = Math.exp(-Math.LN2 / 30 * (ageMs / 86_400_000));
-
-    // Access frequency: Laplace-smoothed so new episodes aren't penalized
-    const accessFreq = (episode.access_count + 1) / (maxAccess + 1);
-
-    // Final score
-    const finalScore = 0.5 * relevance + 0.3 * recency + 0.2 * accessFreq;
-    scored.push({ episode, finalScore });
+    scored.push({ episode: ep, finalScore: rrfScore });
   }
 
   // Sort by final score descending, take top 3
   scored.sort((a, b) => b.finalScore - a.finalScore);
-  const top3 = scored.slice(0, 3);
+  const top3raw = scored.slice(0, 3);
+
+  // Filter out results with low vector similarity — prevents surfacing irrelevant
+  // keyword-only matches when no episodes are semantically related to the query.
+  // Threshold 0.25 filters clearly unrelated content while keeping tangential matches.
+  const MIN_VECTOR_SIM = 0.25;
+  const top3 = top3raw.filter(s => {
+    const scores = precomputed.get(s.episode.rowid);
+    return scores ? scores.vectorSim >= MIN_VECTOR_SIM : false;
+  });
 
   // Format as memory bites
   const bites: MemoryBite[] = top3.map(s => ({

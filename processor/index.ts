@@ -7,7 +7,8 @@ import { LocalGGUFProvider } from '../mcp/providers.js';
 import { StateStore } from './state.js';
 import { SessionTailer } from './session-tailer.js';
 import { runConsolidation } from './consolidator.js';
-import { createEngramServer, SOCKET_PATH } from '../shared/uds.js';
+import { SOCKET_PATH } from '../shared/uds.js';
+import { writeRecollections } from './recollection-writer.js';
 import { resolveProjectFromJsonlPath } from '../shared/project-resolver.js';
 import { upsertProject, generateProjectDescription } from '../shared/project-describer.js';
 import { extractFilePathsFromJsonl, extractFilePathsFromSession } from '../shared/file-path-extractor.js';
@@ -170,7 +171,8 @@ let stateStore: StateStore;
 const tailers = new Map<string, SessionTailer>();
 let chokidarWatcher: any = null;
 let shutdownInProgress = false;
-let udsServer: ReturnType<typeof createEngramServer> | null = null;
+let udsServer: ReturnType<typeof Bun.serve> | null = null;
+const startTime = Date.now();
 const RECOLLECTIONS_DIR = path.join(os.homedir(), '.claude-memory', 'recollections');
 
 async function shutdown(reason: string): Promise<void> {
@@ -194,9 +196,9 @@ async function shutdown(reason: string): Promise<void> {
   );
   tailers.clear();
 
-  // Close UDS server
+  // Stop UDS server
   if (udsServer) {
-    udsServer.close();
+    udsServer.stop();
     try { fs.unlinkSync(SOCKET_PATH); } catch {}
     udsServer = null;
   }
@@ -500,23 +502,134 @@ async function main(): Promise<void> {
   // 5.3. Backfill parent_project for all known projects
   runParentDetection(db);
 
-  // 5.5. Start UDS listener for hook-to-daemon communication
-  udsServer = createEngramServer(SOCKET_PATH, async (msg) => {
-    if (msg.event === 'flush' && msg.sessionId) {
-      for (const [tailerPath, tailer] of tailers) {
-        if (path.basename(tailerPath, '.jsonl') === msg.sessionId) {
-          console.error(`[uds] Flush requested for session ${msg.sessionId.slice(0, 8)}`);
-          try {
-            await tailer.flush();
-          } catch (err: any) {
-            console.error('[uds] flush failed:', err.message);
-          }
-          break;
-        }
+  // 5.4. Purge stale .state and .state.lock files from recollections dir
+  // These were used by the old PreToolUse dedup system and are no longer needed.
+  try {
+    fs.mkdirSync(RECOLLECTIONS_DIR, { recursive: true });
+    const recollectionFiles = fs.readdirSync(RECOLLECTIONS_DIR);
+    let purged = 0;
+    for (const file of recollectionFiles) {
+      if (file.endsWith('.state') || file.endsWith('.state.lock')) {
+        try {
+          fs.unlinkSync(path.join(RECOLLECTIONS_DIR, file));
+          purged++;
+        } catch {}
       }
     }
+    if (purged > 0) {
+      console.error(`[engram] Purged ${purged} stale .state/.state.lock files`);
+    }
+  } catch {}
+
+  // 5.5. Start HTTP-over-UDS server for hook-to-daemon communication
+  // Remove stale socket file if it exists
+  try { fs.unlinkSync(SOCKET_PATH); } catch {}
+  fs.mkdirSync(path.dirname(SOCKET_PATH), { recursive: true });
+
+  udsServer = Bun.serve({
+    unix: SOCKET_PATH,
+    async fetch(req) {
+      const url = new URL(req.url);
+
+      // POST /recollect — real-time recollection computation
+      if (req.method === 'POST' && url.pathname === '/recollect') {
+        try {
+          const body = await req.json() as { prompt?: string; sessionId?: string };
+          const { prompt, sessionId } = body;
+          if (!prompt || !sessionId) {
+            return Response.json({ error: 'Missing prompt or sessionId', bites: [] }, { status: 400 });
+          }
+
+          // Look up tailer by sessionId
+          let tailerEntry: { tailer: SessionTailer; tailerPath: string } | null = null;
+          for (const [tailerPath, tailer] of tailers) {
+            if (path.basename(tailerPath, '.jsonl') === sessionId) {
+              tailerEntry = { tailer, tailerPath };
+              break;
+            }
+          }
+
+          // Get previousEmbedding and projectName from the tailer, or use null for cold sessions
+          const previousEmbedding = tailerEntry?.tailer.previousEmbedding ?? null;
+          const projectName = tailerEntry?.tailer.projectName ?? null;
+
+          console.error(`[http] /recollect for session ${sessionId.slice(0, 8)} (tailer: ${tailerEntry ? 'found' : 'cold'})`);
+
+          const result = await writeRecollections(
+            sessionId,
+            prompt,
+            '', // no userMessageUuid from hook
+            projectName,
+            previousEmbedding,
+            embedProvider,
+            db,
+            true, // force=true to bypass topic gate since this is a new prompt
+          );
+
+          // Update tailer's previousEmbedding so topic gate works correctly
+          if (tailerEntry) {
+            tailerEntry.tailer.previousEmbedding = result.embedding;
+          }
+
+          // Read the recollection file that writeRecollections wrote
+          const recollectionPath = path.join(RECOLLECTIONS_DIR, `${sessionId}.json`);
+          try {
+            const fileContent = fs.readFileSync(recollectionPath, 'utf-8');
+            const recollection = JSON.parse(fileContent);
+            return Response.json({ bites: recollection.bites ?? [], timestamp: recollection.timestamp ?? Date.now() });
+          } catch {
+            // File write may have been skipped (e.g. empty results)
+            return Response.json({ bites: [], timestamp: Date.now() });
+          }
+        } catch (err: any) {
+          console.error(`[http] /recollect error: ${err.message}`);
+          return Response.json({ error: err.message, bites: [] }, { status: 500 });
+        }
+      }
+
+      // POST /flush — force extraction for a session
+      if (req.method === 'POST' && url.pathname === '/flush') {
+        try {
+          const body = await req.json() as { sessionId?: string };
+          const { sessionId } = body;
+          if (!sessionId) {
+            return Response.json({ error: 'Missing sessionId' }, { status: 400 });
+          }
+
+          for (const [tailerPath, tailer] of tailers) {
+            if (path.basename(tailerPath, '.jsonl') === sessionId) {
+              console.error(`[http] Flush requested for session ${sessionId.slice(0, 8)}`);
+              try {
+                await tailer.flush();
+              } catch (err: any) {
+                console.error('[http] flush failed:', err.message);
+              }
+              break;
+            }
+          }
+          return new Response('OK', { status: 200 });
+        } catch (err: any) {
+          console.error(`[http] /flush error: ${err.message}`);
+          return new Response('Internal Server Error', { status: 500 });
+        }
+      }
+
+      // GET /health — daemon health check
+      if (req.method === 'GET' && url.pathname === '/health') {
+        return Response.json({
+          status: 'ok',
+          pid: process.pid,
+          uptimeMs: Date.now() - startTime,
+        });
+      }
+
+      return new Response('Not Found', { status: 404 });
+    },
   });
-  console.error('[engram] UDS listener ready');
+
+  // Restrict socket permissions to owner only
+  fs.chmodSync(SOCKET_PATH, 0o600);
+  console.error(`[engram] HTTP-over-UDS server ready on ${SOCKET_PATH}`);
 
   // 6. Discover active sessions (sorted by recency — warm sessions first)
   const sessions = discoverSessions();
