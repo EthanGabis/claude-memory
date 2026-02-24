@@ -18,6 +18,7 @@ import { startWatcher, discoverProjectMemoryDirs } from './watcher.js';
 import { withFileLock } from '../shared/file-lock.js';
 import { resolveProjectFromCwd } from '../shared/project-resolver.js';
 import { SOCKET_PATH } from '../shared/uds.js';
+import { getProjectFamily, sqlInPlaceholders } from '../shared/project-family.js';
 
 // ---------------------------------------------------------------------------
 // Startup checks
@@ -705,14 +706,15 @@ async function handleMemoryRecall(args: {
     const candidateMap = new Map<string, { episode: EpisodeRow; rawBM25: number }>();
 
     // BM25 candidates
+    const family = project ? getProjectFamily(db, project) : [];
     const episodeByRowid = project
-      ? db.prepare('SELECT *, rowid FROM episodes WHERE rowid = ? AND (scope = \'global\' OR project = ?)')
+      ? db.prepare(`SELECT *, rowid FROM episodes WHERE rowid = ? AND (scope = 'global' OR project IN (${sqlInPlaceholders(family)}))`)
       : db.prepare('SELECT *, rowid FROM episodes WHERE rowid = ?');
 
     for (const row of bm25Rows) {
       const episode = (
         project
-          ? episodeByRowid.get(row.rowid, project)
+          ? episodeByRowid.get(row.rowid, ...family)
           : episodeByRowid.get(row.rowid)
       ) as EpisodeRow | undefined;
       if (episode) {
@@ -724,8 +726,8 @@ async function handleMemoryRecall(args: {
     const recentEpisodes = (
       project
         ? db.prepare(
-            'SELECT *, rowid FROM episodes WHERE embedding IS NOT NULL AND (scope = \'global\' OR project = ?) ORDER BY created_at DESC LIMIT ?',
-          ).all(project, candidateCount)
+            `SELECT *, rowid FROM episodes WHERE embedding IS NOT NULL AND (scope = 'global' OR project IN (${sqlInPlaceholders(family)})) ORDER BY created_at DESC LIMIT ?`,
+          ).all(...family, candidateCount)
         : db.prepare(
             'SELECT *, rowid FROM episodes WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT ?',
           ).all(candidateCount)
@@ -863,15 +865,27 @@ async function handleMemoryExpand(args: { id: string }) {
     }
 
     // C1: Scope/project boundary check — only allow expanding episodes
-    // that are global or belong to the current project (prevents cross-project leaks)
+    // that are global or belong to the current project family (prevents cross-project leaks)
     if (episode.scope === 'project' && episode.project) {
       const currentProject = detectProject();
-      if (!currentProject || currentProject.name !== episode.project) {
+      if (!currentProject) {
         return {
           content: [
             {
               type: 'text' as const,
               text: `Cannot expand memory from project "${episode.project}" — not the current project.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      const family = getProjectFamily(db, currentProject.name);
+      if (!family.includes(episode.project)) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Cannot expand memory from project "${episode.project}" — not in the current project family.`,
             },
           ],
           isError: true,
@@ -975,19 +989,31 @@ async function handleMemoryForget(args: { id: string }) {
     }
 
     // W3 + C3: Scope/project boundary check — only allow deleting episodes
-    // that are global or belong to the current project.
+    // that are global or belong to the current project family.
     // NOTE (C3): Comparison uses project basename only (episodes table stores basename).
     // Two repos with identical basenames could theoretically cross-delete. A full fix
     // requires a schema migration to store canonical project paths. Low practical risk
     // since project names are typically unique within a user's workspace.
     if (episode.scope === 'project' && episode.project) {
       const currentProject = detectProject();
-      if (!currentProject || currentProject.name !== episode.project) {
+      if (!currentProject) {
         return {
           content: [
             {
               type: 'text' as const,
               text: `Cannot delete memory from project "${episode.project}" — not the current project.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      const family = getProjectFamily(db, currentProject.name);
+      if (!family.includes(episode.project)) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Cannot delete memory from project "${episode.project}" — not in the current project family.`,
             },
           ],
           isError: true,

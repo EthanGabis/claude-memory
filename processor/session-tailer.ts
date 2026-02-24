@@ -12,6 +12,7 @@ import { extractFilePathsFromEntry } from '../shared/file-path-extractor.js';
 import { inferProjectFromPaths } from '../shared/project-inferrer.js';
 import { clearProjectCache } from '../shared/project-resolver.js';
 import { upsertProject } from '../shared/project-describer.js';
+import { detectParentProject, invalidateFamilyCache } from '../shared/project-family.js';
 import { acquireExtractionSlot, releaseExtractionSlot } from './semaphore.js';
 
 // ---------------------------------------------------------------------------
@@ -399,7 +400,11 @@ export class SessionTailer {
 
     // Register the discovered project in the projects table
     if (inferred.fullPath) {
-      try { upsertProject(this.db, inferred.name, inferred.fullPath); } catch {}
+      try {
+        const parentProject = detectParentProject(this.db, inferred.fullPath);
+        upsertProject(this.db, inferred.name, inferred.fullPath, parentProject);
+        invalidateFamilyCache();
+      } catch {}
     }
 
     console.error(

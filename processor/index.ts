@@ -12,6 +12,7 @@ import { resolveProjectFromJsonlPath } from '../shared/project-resolver.js';
 import { upsertProject, generateProjectDescription } from '../shared/project-describer.js';
 import { extractFilePathsFromJsonl, extractFilePathsFromSession } from '../shared/file-path-extractor.js';
 import { inferProjectFromPaths, PROJECT_MARKERS } from '../shared/project-inferrer.js';
+import { detectParentProject, invalidateFamilyCache } from '../shared/project-family.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -256,7 +257,9 @@ function startTailer(jsonlPath: string): void {
   // Auto-populate projects table
   if (projectInfo.name && projectInfo.fullPath && !projectInfo.isRoot) {
     try {
-      upsertProject(db, projectInfo.name, projectInfo.fullPath);
+      const parentProject = detectParentProject(db, projectInfo.fullPath);
+      upsertProject(db, projectInfo.name, projectInfo.fullPath, parentProject);
+      invalidateFamilyCache();
     } catch (err) {
       console.error(`[engram] Project upsert failed for "${projectInfo.name}": ${(err as Error).message}`);
     }
@@ -344,7 +347,9 @@ async function runStartupMigration(database: Database, openaiClient: any): Promi
 
           // Upsert into projects table
           if (inferred.fullPath) {
-            upsertProject(database, inferred.name, inferred.fullPath);
+            const parentProject = detectParentProject(database, inferred.fullPath);
+            upsertProject(database, inferred.name, inferred.fullPath, parentProject);
+            invalidateFamilyCache();
             projectsDiscovered++;
 
             // Generate description (fire-and-forget)
@@ -391,7 +396,9 @@ async function runProjectDiscovery(database: Database, openaiClient: any): Promi
         });
 
         if (isProject) {
-          upsertProject(database, entry.name, dirPath);
+          const parentProject = detectParentProject(database, dirPath);
+          upsertProject(database, entry.name, dirPath, parentProject);
+          invalidateFamilyCache();
           discovered++;
 
           // Generate description (fire-and-forget)
@@ -406,6 +413,35 @@ async function runProjectDiscovery(database: Database, openaiClient: any): Promi
 
   if (discovered > 0) {
     console.error(`[engram] Auto-discovered ${discovered} projects from filesystem`);
+  }
+}
+
+/**
+ * Backfill parent_project for all existing projects.
+ * Runs once at startup after schema migration and project discovery.
+ * Idempotent — only updates rows where parent_project changed.
+ */
+function runParentDetection(database: Database): void {
+  const projects = database.prepare(
+    `SELECT full_path, parent_project FROM projects`
+  ).all() as { full_path: string; parent_project: string | null }[];
+
+  let updated = 0;
+  const updateStmt = database.prepare(
+    `UPDATE projects SET parent_project = ? WHERE full_path = ?`
+  );
+
+  for (const row of projects) {
+    const detected = detectParentProject(database, row.full_path);
+    if (detected !== row.parent_project) {
+      updateStmt.run(detected, row.full_path);
+      updated++;
+    }
+  }
+
+  if (updated > 0) {
+    invalidateFamilyCache();
+    console.error(`[engram] Parent detection backfill: ${updated} projects updated`);
   }
 }
 
@@ -458,6 +494,9 @@ async function main(): Promise<void> {
 
   // 5.2. Auto-discover projects from filesystem
   await runProjectDiscovery(db, openaiClient);
+
+  // 5.3. Backfill parent_project for all known projects
+  runParentDetection(db);
 
   // 5.5. Start UDS listener for hook-to-daemon communication
   udsServer = createEngramServer(SOCKET_PATH, async (msg) => {

@@ -4,6 +4,7 @@ import os from 'node:os';
 import type { Database } from 'bun:sqlite';
 import { packEmbedding, cosineSimilarity } from '../mcp/embeddings.js';
 import type { EmbeddingProvider } from '../mcp/providers.js';
+import { getProjectFamily, sqlInPlaceholders } from '../shared/project-family.js';
 
 // ---------------------------------------------------------------------------
 // Configurable topic-change threshold
@@ -147,23 +148,28 @@ export async function writeRecollections(
 
   // Fetch recent episodes matching scope filter (for vector search)
   // When projectName is null, NULL != NULL in SQL, so only fetch global episodes
-  const episodes = projectName
-    ? db.prepare(
-        `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
-         FROM episodes
-         WHERE (scope = 'global' OR project = ?)
-         AND embedding IS NOT NULL
-         ORDER BY accessed_at DESC
-         LIMIT 200`,
-      ).all(projectName) as EpisodeRow[]
-    : db.prepare(
-        `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
-         FROM episodes
-         WHERE scope = 'global'
-         AND embedding IS NOT NULL
-         ORDER BY accessed_at DESC
-         LIMIT 200`,
-      ).all() as EpisodeRow[];
+  let episodes: EpisodeRow[];
+  if (!projectName) {
+    episodes = db.prepare(
+      `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
+       FROM episodes
+       WHERE scope = 'global'
+       AND embedding IS NOT NULL
+       ORDER BY accessed_at DESC
+       LIMIT 200`,
+    ).all() as EpisodeRow[];
+  } else {
+    const family = getProjectFamily(db, projectName);
+    const placeholders = sqlInPlaceholders(family);
+    episodes = db.prepare(
+      `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
+       FROM episodes
+       WHERE (scope = 'global' OR project IN (${placeholders}))
+       AND embedding IS NOT NULL
+       ORDER BY accessed_at DESC
+       LIMIT 200`,
+    ).all(...family) as EpisodeRow[];
+  }
 
   if (episodes.length === 0) {
     // No episodes yet — write empty recollection

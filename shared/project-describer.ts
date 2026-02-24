@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Database } from 'bun:sqlite';
+import { getProjectFamily, sqlInPlaceholders } from './project-family.js';
 
 interface ProjectRow {
   name: string;
@@ -11,21 +12,23 @@ interface ProjectRow {
 
 /**
  * Upsert a project into the projects table.
- * If the project already exists, updates full_path and updated_at (but not description/source).
+ * If the project already exists, updates full_path, parent_project, and updated_at (but not description/source).
  */
 export function upsertProject(
   db: Database,
   name: string,
   fullPath: string,
+  parentProject: string | null = null,
 ): void {
   const now = Date.now();
   db.prepare(`
-    INSERT INTO projects (full_path, name, description, source, created_at, updated_at)
-    VALUES (?, ?, NULL, 'auto', ?, ?)
+    INSERT INTO projects (full_path, name, description, source, parent_project, created_at, updated_at)
+    VALUES (?, ?, NULL, 'auto', ?, ?, ?)
     ON CONFLICT(full_path) DO UPDATE SET
       name = excluded.name,
+      parent_project = excluded.parent_project,
       updated_at = excluded.updated_at
-  `).run(fullPath, name, now, now);
+  `).run(fullPath, name, parentProject, now, now);
 }
 
 /**
@@ -74,13 +77,15 @@ export async function generateProjectDescription(
     }
   }
 
-  // Strategy 2: Summarize from recent episodes
+  // Strategy 2: Summarize from recent episodes (family-aware: includes child projects)
+  const family = getProjectFamily(db, projectName);
+  const placeholders = sqlInPlaceholders(family);
   const episodes = db.prepare(`
     SELECT summary FROM episodes
-    WHERE project = ?
+    WHERE project IN (${placeholders})
     ORDER BY created_at DESC
     LIMIT 10
-  `).all(projectName) as { summary: string }[];
+  `).all(...family) as { summary: string }[];
 
   if (episodes.length >= 3) {
     const episodeSummaries = episodes.map(e => `- ${e.summary}`).join('\n');

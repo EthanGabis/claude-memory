@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { packEmbedding, cosineSimilarity } from '../mcp/embeddings.js';
 import type { EmbeddingProvider } from '../mcp/providers.js';
 import type { Database } from 'bun:sqlite';
+import { getProjectFamily, sqlInPlaceholders } from '../shared/project-family.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -161,23 +162,26 @@ export function fetchEpisodeSnapshot(db: Database, projectName: string | null): 
   // When projectName is null, NULL != NULL in SQL, so only fetch global episodes
   // Fix #6: Include scope and project for boundary enforcement in upsertEpisode
   // W6: Include full_content in snapshot to avoid N+1 query on merge
-  return projectName
-    ? db.prepare(
-        `SELECT id, summary, full_content, entities, embedding, access_count, scope, project
-         FROM episodes
-         WHERE (scope = 'global' OR project = ?)
-         AND embedding IS NOT NULL
-         ORDER BY accessed_at DESC
-         LIMIT 500`,
-      ).all(projectName) as EpisodeRow[]
-    : db.prepare(
-        `SELECT id, summary, full_content, entities, embedding, access_count, scope, project
-         FROM episodes
-         WHERE scope = 'global'
-         AND embedding IS NOT NULL
-         ORDER BY accessed_at DESC
-         LIMIT 500`,
-      ).all() as EpisodeRow[];
+  if (!projectName) {
+    return db.prepare(
+      `SELECT id, summary, full_content, entities, embedding, access_count, scope, project
+       FROM episodes
+       WHERE scope = 'global'
+       AND embedding IS NOT NULL
+       ORDER BY accessed_at DESC
+       LIMIT 500`,
+    ).all() as EpisodeRow[];
+  }
+  const family = getProjectFamily(db, projectName);
+  const placeholders = sqlInPlaceholders(family);
+  return db.prepare(
+    `SELECT id, summary, full_content, entities, embedding, access_count, scope, project
+     FROM episodes
+     WHERE (scope = 'global' OR project IN (${placeholders}))
+     AND embedding IS NOT NULL
+     ORDER BY accessed_at DESC
+     LIMIT 500`,
+  ).all(...family) as EpisodeRow[];
 }
 
 export interface UpsertResult {

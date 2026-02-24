@@ -320,6 +320,59 @@ export function initDb(dbPath: string): Database {
     }
   }
 
+  // --- Schema version 6 migration: add parent_project to projects ---
+  const v6Row = db.query<{ value: string }, []>(
+    `SELECT value FROM _meta WHERE key = 'schema_version'`
+  ).get();
+  const v6Version = v6Row ? parseInt(v6Row.value, 10) : 1;
+
+  if (v6Version < 6) {
+    const runV6Migration = () => {
+      db.exec(`BEGIN EXCLUSIVE`);
+      try {
+        db.exec(`ALTER TABLE projects ADD COLUMN parent_project TEXT`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_projects_parent ON projects(parent_project)`);
+        db.exec(`UPDATE _meta SET value = '6' WHERE key = 'schema_version'`);
+        db.exec(`COMMIT`);
+      } catch (err) {
+        try { db.exec(`ROLLBACK`); } catch {}
+        if ((err as Error).message?.includes('duplicate column')) {
+          // Column exists from a partial prior migration — just bump version and add index atomically
+          db.exec(`BEGIN EXCLUSIVE`);
+          try {
+            db.exec(`CREATE INDEX IF NOT EXISTS idx_projects_parent ON projects(parent_project)`);
+            db.exec(`UPDATE _meta SET value = '6' WHERE key = 'schema_version'`);
+            db.exec(`COMMIT`);
+          } catch (innerErr) {
+            try { db.exec(`ROLLBACK`); } catch {}
+            throw innerErr;
+          }
+        } else {
+          throw err;
+        }
+      }
+    };
+
+    try {
+      runV6Migration();
+    } catch (err) {
+      if ((err as Error).message?.includes('SQLITE_BUSY') || (err as Error).message?.includes('database is locked')) {
+        console.error('[schema] v6 migration busy — retrying in 6s');
+        Bun.sleepSync(6000);
+        const recheck = db.query<{ value: string }, []>(
+          `SELECT value FROM _meta WHERE key = 'schema_version'`
+        ).get();
+        if (recheck && parseInt(recheck.value, 10) >= 6) {
+          console.error('[schema] v6 migration completed by other process');
+        } else {
+          runV6Migration();
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
   return db;
 }
 
