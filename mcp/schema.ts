@@ -598,6 +598,58 @@ export function initDb(dbPath: string): Database {
     }
   }
 
+  // --- Schema version 10 migration: add peak_confidence to beliefs ---
+  const v10Row = db.query<{ value: string }, []>(
+    `SELECT value FROM _meta WHERE key = 'schema_version'`
+  ).get();
+  const v10Version = v10Row ? parseInt(v10Row.value, 10) : 1;
+
+  if (v10Version < 10) {
+    const runV10Migration = () => {
+      db.exec(`BEGIN EXCLUSIVE`);
+      try {
+        db.exec(`ALTER TABLE beliefs ADD COLUMN peak_confidence REAL DEFAULT NULL`);
+        // Backfill peak_confidence for existing beliefs
+        db.exec(`UPDATE beliefs SET peak_confidence = confidence_alpha / (confidence_alpha + confidence_beta) WHERE peak_confidence IS NULL`);
+        db.exec(`UPDATE _meta SET value = '10' WHERE key = 'schema_version'`);
+        db.exec(`COMMIT`);
+      } catch (err) {
+        try { db.exec(`ROLLBACK`); } catch {}
+        if ((err as Error).message?.includes('duplicate column')) {
+          db.exec(`BEGIN EXCLUSIVE`);
+          try {
+            db.exec(`UPDATE _meta SET value = '10' WHERE key = 'schema_version'`);
+            db.exec(`COMMIT`);
+          } catch (innerErr) {
+            try { db.exec(`ROLLBACK`); } catch {}
+            throw innerErr;
+          }
+        } else {
+          throw err;
+        }
+      }
+    };
+
+    try {
+      runV10Migration();
+    } catch (err) {
+      if ((err as Error).message?.includes('SQLITE_BUSY') || (err as Error).message?.includes('database is locked')) {
+        console.error('[schema] v10 migration busy — retrying in 6s');
+        Bun.sleepSync(6000);
+        const recheck = db.query<{ value: string }, []>(
+          `SELECT value FROM _meta WHERE key = 'schema_version'`
+        ).get();
+        if (recheck && parseInt(recheck.value, 10) >= 10) {
+          console.error('[schema] v10 migration completed by other process');
+        } else {
+          runV10Migration();
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
   return db;
 }
 
@@ -627,6 +679,7 @@ export interface Belief {
   last_reinforced_at: number | null;
   last_accessed_at: number | null;
   access_count: number;
+  peak_confidence: number | null;
 }
 
 export const DB_PATH = path.join(

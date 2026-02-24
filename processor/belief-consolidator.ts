@@ -194,7 +194,7 @@ export async function runBeliefConsolidation(
   // -----------------------------------------------------------------------
   // 3. SYNTHESIZE + 4. MATCH — for each cluster
   // -----------------------------------------------------------------------
-  const candidatesForRevision: { beliefId: string; previousConfidence: number }[] = [];
+  const candidatesForRevision: { beliefId: string }[] = [];
   const partialAccumulator = new Map<string, number>(); // beliefId -> count of PARTIAL classifications this cycle
   const processedEpisodeIds = new Set<string>(); // Track which episodes were actually processed
 
@@ -230,10 +230,16 @@ export async function runBeliefConsolidation(
   // 5. REVISION CHECK
   // -----------------------------------------------------------------------
   if (!budgetExceeded(cycleStart)) {
-    for (const { beliefId, previousConfidence } of candidatesForRevision) {
+    for (const { beliefId } of candidatesForRevision) {
       if (budgetExceeded(cycleStart)) break;
       try {
-        await checkAndRevise(db, openai, embedProvider, beliefId, previousConfidence, log);
+        // Load peak_confidence from the belief row to use as previousConfidence
+        const beliefRow = db.query<{ peak_confidence: number | null }, [string]>(
+          `SELECT peak_confidence FROM beliefs WHERE id = ?`
+        ).get(beliefId);
+        // If peak_confidence is null, skip revision for this belief
+        if (!beliefRow || beliefRow.peak_confidence == null) continue;
+        await checkAndRevise(db, openai, embedProvider, beliefId, beliefRow.peak_confidence, log);
       } catch (err) {
         log(`Revision error for ${beliefId}: ${(err as Error).message}`);
       }
@@ -452,7 +458,7 @@ async function matchCandidate(
   db: Database,
   openai: OpenAI,
   candidate: BeliefCandidate,
-  candidatesForRevision: { beliefId: string; previousConfidence: number }[],
+  candidatesForRevision: { beliefId: string }[],
   partialAccumulator: Map<string, number>,
   cycleStart: number,
   log: (msg: string) => void,
@@ -516,9 +522,8 @@ async function matchCandidate(
           break;
 
         case 'CONTRADICTS': {
-          const previousConfidence = beliefConfidence(belief.confidence_alpha, belief.confidence_beta);
           contradictBelief(db, belief, candidate.episodeIds, now, log);
-          candidatesForRevision.push({ beliefId: belief.id, previousConfidence });
+          candidatesForRevision.push({ beliefId: belief.id });
           matched = true;
           mutated = true;
           break;
@@ -528,15 +533,16 @@ async function matchCandidate(
           // Log to contradicting_episodes with PARTIAL flag, and weakly update both alpha and beta
           const contradicting: string[] = safeParseArray(belief.contradicting_episodes);
           const newContradicting = [...contradicting, ...candidate.episodeIds.map(id => `PARTIAL:${id}`)];
+          const partialIncrement = candidate.episodeIds.length * 0.5;
           db.query(`
             UPDATE beliefs SET
-              confidence_alpha = confidence_alpha + 0.5,
-              confidence_beta = confidence_beta + 0.5,
-              evidence_count = evidence_count + 1,
+              confidence_alpha = confidence_alpha + ?,
+              confidence_beta = confidence_beta + ?,
+              evidence_count = evidence_count + ?,
               contradicting_episodes = ?,
               updated_at = ?
             WHERE id = ?
-          `).run(JSON.stringify(newContradicting), now, belief.id);
+          `).run(partialIncrement, partialIncrement, candidate.episodeIds.length, JSON.stringify(newContradicting), now, belief.id);
 
           partialAccumulator.set(belief.id, (partialAccumulator.get(belief.id) ?? 0) + 1);
           matched = true;
@@ -577,6 +583,7 @@ function createNewBelief(
 ): void {
   const id = generateBeliefId();
   const initialAlpha = 1 + candidate.episodeIds.length; // prior of 1 + N supporting observations
+  const initialPeakConfidence = beliefConfidence(initialAlpha, 1);
   db.query(`
     INSERT INTO beliefs (
       id, statement, subject, predicate, context, timeframe,
@@ -585,8 +592,9 @@ function createNewBelief(
       supporting_episodes, contradicting_episodes,
       revision_history, parent_belief_id, child_belief_ids,
       embedding, status, evidence_count, stability,
-      created_at, updated_at, last_reinforced_at, last_accessed_at, access_count
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, '[]', '[]', NULL, '[]', ?, 'active', ?, 1.0, ?, ?, ?, NULL, 0)
+      created_at, updated_at, last_reinforced_at, last_accessed_at, access_count,
+      peak_confidence
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, '[]', '[]', NULL, '[]', ?, 'active', ?, 1.0, ?, ?, ?, NULL, 0, ?)
   `).run(
     id,
     candidate.statement,
@@ -604,6 +612,7 @@ function createNewBelief(
     now,
     now,
     now,
+    initialPeakConfidence,
   );
 
   log(`Created new belief ${id} (alpha=${initialAlpha}): "${candidate.statement.slice(0, 60)}..."`);
@@ -618,18 +627,25 @@ function reinforceBelief(
 ): void {
   const supporting: string[] = safeParseArray(belief.supporting_episodes);
   const newSupporting = [...supporting, ...episodeIds.filter(id => !supporting.includes(id))];
+  const increment = episodeIds.length;
+
+  const newAlpha = belief.confidence_alpha + increment;
+  const newConfidence = beliefConfidence(newAlpha, belief.confidence_beta);
+  const currentPeak = belief.peak_confidence ?? 0;
+  const newPeak = newConfidence > currentPeak ? newConfidence : currentPeak;
 
   db.query(`
     UPDATE beliefs SET
-      confidence_alpha = confidence_alpha + 1,
+      confidence_alpha = confidence_alpha + ?,
       supporting_episodes = ?,
-      evidence_count = evidence_count + 1,
+      evidence_count = evidence_count + ?,
       last_reinforced_at = ?,
-      updated_at = ?
+      updated_at = ?,
+      peak_confidence = ?
     WHERE id = ?
-  `).run(JSON.stringify(newSupporting), now, now, belief.id);
+  `).run(increment, JSON.stringify(newSupporting), increment, now, now, newPeak, belief.id);
 
-  log(`Reinforced belief ${belief.id} (alpha now ${belief.confidence_alpha + 1})`);
+  log(`Reinforced belief ${belief.id} (alpha now ${newAlpha})`);
 }
 
 function contradictBelief(
@@ -641,17 +657,18 @@ function contradictBelief(
 ): void {
   const contradicting: string[] = safeParseArray(belief.contradicting_episodes);
   const newContradicting = [...contradicting, ...episodeIds.filter(id => !contradicting.includes(id))];
+  const increment = episodeIds.length;
 
   db.query(`
     UPDATE beliefs SET
-      confidence_beta = confidence_beta + 1,
+      confidence_beta = confidence_beta + ?,
       contradicting_episodes = ?,
-      evidence_count = evidence_count + 1,
+      evidence_count = evidence_count + ?,
       updated_at = ?
     WHERE id = ?
-  `).run(JSON.stringify(newContradicting), now, belief.id);
+  `).run(increment, JSON.stringify(newContradicting), increment, now, belief.id);
 
-  log(`Contradicted belief ${belief.id} (beta now ${belief.confidence_beta + 1})`);
+  log(`Contradicted belief ${belief.id} (beta now ${belief.confidence_beta + increment})`);
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +775,7 @@ async function checkAndRevise(
   db.exec('BEGIN IMMEDIATE');
   try {
     // Create new revised belief — inherit alpha/beta from old belief to preserve confidence history
+    const revisedPeakConfidence = beliefConfidence(belief.confidence_alpha, belief.confidence_beta);
     db.query(`
       INSERT INTO beliefs (
         id, statement, subject, predicate, context, timeframe,
@@ -766,8 +784,9 @@ async function checkAndRevise(
         supporting_episodes, contradicting_episodes,
         revision_history, parent_belief_id, child_belief_ids,
         embedding, status, evidence_count, stability,
-        created_at, updated_at, last_reinforced_at, last_accessed_at, access_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, '[]', ?, 'active', ?, 1.0, ?, ?, NULL, NULL, 0)
+        created_at, updated_at, last_reinforced_at, last_accessed_at, access_count,
+        peak_confidence
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, '[]', ?, 'active', ?, 1.0, ?, ?, NULL, NULL, 0, ?)
     `).run(
       newId,
       parsed.revised_statement,
@@ -787,6 +806,7 @@ async function checkAndRevise(
       belief.evidence_count,
       now,
       now,
+      revisedPeakConfidence,
     );
 
     // Update old belief: status → revised, link child
@@ -885,6 +905,10 @@ async function checkAndSplit(
 
   db.exec('BEGIN IMMEDIATE');
   try {
+    // Split children inherit half the parent's evidence
+    const childAlpha = Math.max(1, Math.round(belief.confidence_alpha / 2));
+    const childBeta = Math.max(1, Math.round(belief.confidence_beta / 2));
+
     // Create variant A — inherits supporting_episodes and evidence_count from original
     db.query(`
       INSERT INTO beliefs (
@@ -895,7 +919,7 @@ async function checkAndSplit(
         revision_history, parent_belief_id, child_belief_ids,
         embedding, status, evidence_count, stability,
         created_at, updated_at, last_reinforced_at, last_accessed_at, access_count
-      ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, '[]', '[]', ?, '[]', ?, 'active', ?, 1.0, ?, ?, NULL, NULL, 0)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?, '[]', ?, 'active', ?, 1.0, ?, ?, NULL, NULL, 0)
     `).run(
       idA,
       parsed.variant_a.statement,
@@ -903,6 +927,7 @@ async function checkAndSplit(
       belief.predicate,
       parsed.variant_a.context,
       belief.timeframe,
+      childAlpha, childBeta,
       belief.scope, belief.project, belief.project_path,
       belief.supporting_episodes,
       belief.id,
@@ -921,7 +946,7 @@ async function checkAndSplit(
         revision_history, parent_belief_id, child_belief_ids,
         embedding, status, evidence_count, stability,
         created_at, updated_at, last_reinforced_at, last_accessed_at, access_count
-      ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, '[]', '[]', ?, '[]', ?, 'active', ?, 1.0, ?, ?, NULL, NULL, 0)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?, '[]', ?, 'active', ?, 1.0, ?, ?, NULL, NULL, 0)
     `).run(
       idB,
       parsed.variant_b.statement,
@@ -929,6 +954,7 @@ async function checkAndSplit(
       belief.predicate,
       parsed.variant_b.context,
       belief.timeframe,
+      childAlpha, childBeta,
       belief.scope, belief.project, belief.project_path,
       belief.supporting_episodes,
       belief.id,
@@ -1021,6 +1047,7 @@ async function checkAndMerge(
       // Merge confidence: combine alpha and beta counts
       const mergedAlpha = Math.max(1, a.confidence_alpha + b.confidence_alpha - 1); // subtract one prior
       const mergedBeta = Math.max(1, a.confidence_beta + b.confidence_beta - 1);
+      const mergedPeakConfidence = beliefConfidence(mergedAlpha, mergedBeta);
 
       db.exec('BEGIN IMMEDIATE');
       try {
@@ -1032,8 +1059,9 @@ async function checkAndMerge(
             supporting_episodes, contradicting_episodes,
             revision_history, parent_belief_id, child_belief_ids,
             embedding, status, evidence_count, stability,
-            created_at, updated_at, last_reinforced_at, last_accessed_at, access_count
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', NULL, '[]', ?, 'active', ?, 1.0, ?, ?, ?, NULL, 0)
+            created_at, updated_at, last_reinforced_at, last_accessed_at, access_count,
+            peak_confidence
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', NULL, '[]', ?, 'active', ?, 1.0, ?, ?, ?, NULL, 0, ?)
         `).run(
           newId,
           parsed.merged_statement,
@@ -1053,6 +1081,7 @@ async function checkAndMerge(
           now,
           now,
           Math.max(a.last_reinforced_at ?? 0, b.last_reinforced_at ?? 0) || null,
+          mergedPeakConfidence,
         );
 
         // Update both originals: status → merged, link child
