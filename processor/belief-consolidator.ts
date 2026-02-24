@@ -594,7 +594,7 @@ function createNewBelief(
       embedding, status, evidence_count, stability,
       created_at, updated_at, last_reinforced_at, last_accessed_at, access_count,
       peak_confidence
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, '[]', '[]', NULL, '[]', ?, 'active', ?, 1.0, ?, ?, ?, NULL, 0, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, '[]', '[]', NULL, '[]', ?, 'active', ?, ${BELIEF_CONFIG.DEFAULT_STABILITY}, ?, ?, ?, NULL, 0, ?)
   `).run(
     id,
     candidate.statement,
@@ -786,7 +786,7 @@ async function checkAndRevise(
         embedding, status, evidence_count, stability,
         created_at, updated_at, last_reinforced_at, last_accessed_at, access_count,
         peak_confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, '[]', ?, 'active', ?, 1.0, ?, ?, NULL, NULL, 0, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, '[]', ?, 'active', ?, ${BELIEF_CONFIG.DEFAULT_STABILITY}, ?, ?, NULL, NULL, 0, ?)
     `).run(
       newId,
       parsed.revised_statement,
@@ -919,7 +919,7 @@ async function checkAndSplit(
         revision_history, parent_belief_id, child_belief_ids,
         embedding, status, evidence_count, stability,
         created_at, updated_at, last_reinforced_at, last_accessed_at, access_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?, '[]', ?, 'active', ?, 1.0, ?, ?, NULL, NULL, 0)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?, '[]', ?, 'active', ?, ${BELIEF_CONFIG.DEFAULT_STABILITY}, ?, ?, NULL, NULL, 0)
     `).run(
       idA,
       parsed.variant_a.statement,
@@ -946,7 +946,7 @@ async function checkAndSplit(
         revision_history, parent_belief_id, child_belief_ids,
         embedding, status, evidence_count, stability,
         created_at, updated_at, last_reinforced_at, last_accessed_at, access_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?, '[]', ?, 'active', ?, 1.0, ?, ?, NULL, NULL, 0)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?, '[]', ?, 'active', ?, ${BELIEF_CONFIG.DEFAULT_STABILITY}, ?, ?, NULL, NULL, 0)
     `).run(
       idB,
       parsed.variant_b.statement,
@@ -1061,7 +1061,7 @@ async function checkAndMerge(
             embedding, status, evidence_count, stability,
             created_at, updated_at, last_reinforced_at, last_accessed_at, access_count,
             peak_confidence
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', NULL, '[]', ?, 'active', ?, 1.0, ?, ?, ?, NULL, 0, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', NULL, '[]', ?, 'active', ?, ${BELIEF_CONFIG.DEFAULT_STABILITY}, ?, ?, ?, NULL, 0, ?)
         `).run(
           newId,
           parsed.merged_statement,

@@ -6,6 +6,7 @@ import { packEmbedding, cosineSimilarity } from '../mcp/embeddings.js';
 import type { EmbeddingProvider } from '../mcp/providers.js';
 import type { Belief } from '../mcp/schema.js';
 import { beliefConfidence, retrievalStrength, BELIEF_CONFIG } from './belief-utils.js';
+import { getProjectFamilyPaths, sqlInPlaceholders } from '../shared/project-family.js';
 
 // ---------------------------------------------------------------------------
 // Configurable topic-change threshold
@@ -76,6 +77,7 @@ export async function writeRecollections(
   embedProvider: EmbeddingProvider,
   db: Database,
   force?: boolean,
+  projectPath?: string | null,
 ): Promise<{ embedding: Float32Array }> {
   // 1. Embed user message locally (~5ms)
   // Truncate to 6000 chars (~1500 tokens) — nomic-embed-text has 8192 token limit
@@ -328,7 +330,7 @@ export async function writeRecollections(
 
   // 5b. Belief blending — query beliefs and append top belief bites
   try {
-    const beliefBites = scoreAndFormatBeliefs(db, ftsQuery, queryBlob, now, projectName);
+    const beliefBites = scoreAndFormatBeliefs(db, ftsQuery, queryBlob, now, projectName, projectPath ?? null);
     bites.push(...beliefBites);
   } catch (err) {
     console.error(`[recollection] Belief blending failed: ${(err as Error).message}`);
@@ -365,6 +367,7 @@ function scoreAndFormatBeliefs(
   queryBlob: Buffer,
   now: number,
   projectName: string | null,
+  projectPath: string | null,
 ): MemoryBite[] {
   // 1. BM25 search on beliefs_fts
   const bm25Map = new Map<number, number>();
@@ -381,11 +384,12 @@ function scoreAndFormatBeliefs(
     }
   }
 
-  // 2. Load active beliefs with embeddings for vector similarity
-  const activeBeliefs = projectName
+  // 2. Load active beliefs with embeddings for vector similarity (project_path family matching)
+  const familyPaths = projectName ? getProjectFamilyPaths(db, projectName) : [];
+  const activeBeliefs = familyPaths.length > 0
     ? db.prepare(
-        `SELECT *, rowid FROM beliefs WHERE status = 'active' AND embedding IS NOT NULL AND (scope = 'global' OR project = ?)`,
-      ).all(projectName) as (Belief & { rowid: number })[]
+        `SELECT *, rowid FROM beliefs WHERE status = 'active' AND embedding IS NOT NULL AND (scope = 'global' OR project_path IN (${sqlInPlaceholders(familyPaths)}))`,
+      ).all(...familyPaths) as (Belief & { rowid: number })[]
     : db.prepare(
         `SELECT *, rowid FROM beliefs WHERE status = 'active' AND embedding IS NOT NULL`,
       ).all() as (Belief & { rowid: number })[];
@@ -427,8 +431,8 @@ function scoreAndFormatBeliefs(
       }
     }
 
-    // Additive formula: score = 0.5 * (confidence * vectorSim) + 0.3 * retrievalStrength + 0.2 * bm25Score
-    const finalScore = 0.5 * (confidence * vectorSim) + 0.3 * retStrength + 0.2 * bm25Score;
+    // Additive formula: vectorSim drives ranking; confidence and retrieval strength are quality modifiers
+    const finalScore = 0.5 * vectorSim + 0.2 * confidence + 0.2 * retStrength + 0.1 * bm25Score;
 
     scored.push({ belief, score: finalScore });
   }
@@ -439,9 +443,10 @@ function scoreAndFormatBeliefs(
 
   if (topBeliefs.length === 0) return [];
 
-  // Update last_accessed_at and access_count for surfaced beliefs
+  // Update last_accessed_at for surfaced beliefs (access_count is
+  // incremented only in server.ts recall/expand — not here, to avoid double-counting)
   const updateStmt = db.prepare(
-    'UPDATE beliefs SET last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?',
+    'UPDATE beliefs SET last_accessed_at = ? WHERE id = ?',
   );
   for (const s of topBeliefs) {
     updateStmt.run(now, s.belief.id);
@@ -476,6 +481,7 @@ export async function refreshRecollection(
   previousEmbedding: Float32Array | null,
   embedProvider: EmbeddingProvider,
   db: Database,
+  projectPath?: string | null,
 ): Promise<{ embedding: Float32Array }> {
   // Re-use the main writeRecollections function — force=true bypasses topic gate
   return writeRecollections(
@@ -487,6 +493,7 @@ export async function refreshRecollection(
     embedProvider,
     db,
     true, // force: skip topic-change gate since we just extracted new episodes
+    projectPath,
   );
 }
 

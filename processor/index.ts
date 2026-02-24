@@ -618,9 +618,10 @@ async function main(): Promise<void> {
             }
           }
 
-          // Get previousEmbedding and projectName from the tailer, or use null for cold sessions
+          // Get previousEmbedding, projectName, and projectPath from the tailer, or use null for cold sessions
           const previousEmbedding = tailerEntry?.tailer.previousEmbedding ?? null;
           const projectName = tailerEntry?.tailer.projectName ?? null;
+          const projectPath = tailerEntry?.tailer.projectPath ?? null;
 
           console.error(`[http] /recollect for session ${sessionId.slice(0, 8)} (tailer: ${tailerEntry ? 'found' : 'cold'})`);
 
@@ -633,6 +634,7 @@ async function main(): Promise<void> {
             embedProvider,
             db,
             true, // force=true to bypass topic gate since this is a new prompt
+            projectPath,
           );
 
           // Update tailer's previousEmbedding so topic gate works correctly
@@ -818,7 +820,7 @@ async function main(): Promise<void> {
 
   // Cold consolidation (every 4h) — overlap-guarded
   let isConsolidating = false;
-  setInterval(async () => {
+  const runConsolidationGuarded = async () => {
     if (isConsolidating) return;
     isConsolidating = true;
     try {
@@ -829,7 +831,10 @@ async function main(): Promise<void> {
     } finally {
       isConsolidating = false;
     }
-  }, COLD_CONSOLIDATION_INTERVAL_MS);
+  };
+  // Run first consolidation 60 seconds after startup so short-lived sessions still consolidate
+  setTimeout(runConsolidationGuarded, 60_000);
+  setInterval(runConsolidationGuarded, COLD_CONSOLIDATION_INTERVAL_MS);
 
   // Aggressive memory monitoring during startup burst (first 5 min)
   // The normal 60s scan interval is too slow — RSS can spike 300MB in one interval

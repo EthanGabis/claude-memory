@@ -50,6 +50,8 @@ export function shouldArchive(
   const referenceTime = lastReinforcedAt ?? createdAt;
   const daysSinceReinforced = (now - referenceTime) / (1000 * 60 * 60 * 24);
   if (daysSinceReinforced > 90 && evidenceCount < 5) return true;
+  // Long-stale beliefs with mediocre confidence should eventually archive
+  if (confidence < 0.5 && daysSinceReinforced > 180) return true;
   return false;
 }
 
@@ -129,6 +131,9 @@ export const BELIEF_CONFIG = {
   // Decay
   ARCHIVE_STALE_DAYS: 90,
   ARCHIVE_MIN_EVIDENCE: 5,
+
+  // Stability
+  DEFAULT_STABILITY: 7.0,
 
   // Retrieval
   MAX_BELIEF_BITES: 2,

@@ -568,6 +568,7 @@ export class SessionTailer {
               null, // null forces topic gate bypass
               this.embedProvider,
               this.db,
+              this.projectPath,
             );
             this.previousEmbedding = refreshResult.embedding;
           } catch (err) {
