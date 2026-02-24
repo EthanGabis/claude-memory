@@ -143,6 +143,7 @@ export async function indexFile(
   layer: 'global' | 'project',
   project?: string,
   provider?: EmbeddingProvider | null,
+  projectPath?: string | null,
 ): Promise<number> {
   let content: string;
   try {
@@ -161,8 +162,8 @@ export async function indexFile(
 
   const deleteStmt = db.prepare('DELETE FROM chunks WHERE path = ?');
   const insertStmt = db.prepare(`
-    INSERT INTO chunks (id, path, layer, project, start_line, end_line, hash, text, embedding, updated_at)
-    VALUES ($id, $path, $layer, $project, $startLine, $endLine, $hash, $text, NULL, $updatedAt)
+    INSERT INTO chunks (id, path, layer, project, project_path, start_line, end_line, hash, text, embedding, updated_at)
+    VALUES ($id, $path, $layer, $project, $projectPath, $startLine, $endLine, $hash, $text, NULL, $updatedAt)
   `);
 
   const updateEmbStmt = db.prepare('UPDATE chunks SET embedding = ? WHERE id = ?');
@@ -175,6 +176,7 @@ export async function indexFile(
         $path: chunk.path,
         $layer: chunk.layer,
         $project: chunk.project,
+        $projectPath: projectPath ?? null,
         $startLine: chunk.startLine,
         $endLine: chunk.endLine,
         $hash: chunk.hash,
@@ -250,12 +252,13 @@ export async function indexDirectory(
   layer: 'global' | 'project',
   project?: string,
   provider?: EmbeddingProvider | null,
+  projectPath?: string | null,
 ): Promise<number> {
   const files = collectMarkdownFiles(dirPath);
   let totalChunks = 0;
 
   for (const file of files) {
-    totalChunks += await indexFile(db, file, layer, project, provider);
+    totalChunks += await indexFile(db, file, layer, project, provider, projectPath);
   }
 
   return totalChunks;
@@ -290,8 +293,14 @@ export async function backfillEmbeddings(
       }
     }
 
+    // Look up projectPath from the projects table for proper chunk tagging
+    const projectRow = project
+      ? (db.prepare('SELECT full_path FROM projects WHERE name = ? ORDER BY full_path LIMIT 1').get(project) as { full_path: string } | null)
+      : null;
+    const projectPath = projectRow?.full_path ?? null;
+
     try {
-      await indexFile(db, filePath, layer, project, provider);
+      await indexFile(db, filePath, layer, project, provider, projectPath);
     } catch (err) {
       console.error(`[indexer] Backfill failed for ${path.basename(filePath)}: ${(err as Error).message}`);
     }

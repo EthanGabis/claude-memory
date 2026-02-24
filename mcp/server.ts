@@ -18,7 +18,7 @@ import { startWatcher, discoverProjectMemoryDirs } from './watcher.js';
 import { withFileLock } from '../shared/file-lock.js';
 import { resolveProjectFromCwd } from '../shared/project-resolver.js';
 import { SOCKET_PATH } from '../shared/uds.js';
-import { getProjectFamily, sqlInPlaceholders } from '../shared/project-family.js';
+import { getProjectFamilyPaths, sqlInPlaceholders } from '../shared/project-family.js';
 
 // ---------------------------------------------------------------------------
 // Startup checks
@@ -542,7 +542,7 @@ async function saveToLog(
   await fs.appendFile(logPath, entry, 'utf-8');
 
   // Re-index the file
-  await indexFile(db, logPath, layer, projectName, provider);
+  await indexFile(db, logPath, layer, projectName, provider, project?.root ?? null);
 
   return {
     content: [
@@ -619,7 +619,7 @@ async function saveToMemory(
   // Note: the consolidator also writes MEMORY.md but does NOT add to recentlySaved.
   // This is intentional — the consolidator runs in the processor process (not the
   // MCP server), so the MCP server's watcher will correctly re-index the changes.
-  await indexFile(db, memoryPath, layer, projectName, provider);
+  await indexFile(db, memoryPath, layer, projectName, provider, project?.root ?? null);
 
   return {
     content: [
@@ -639,6 +639,7 @@ interface EpisodeRow {
   id: string;
   session_id: string;
   project: string | null;
+  project_path: string | null;
   scope: string;
   summary: string;
   entities: string | null;
@@ -706,15 +707,15 @@ async function handleMemoryRecall(args: {
     const candidateMap = new Map<string, { episode: EpisodeRow; rawBM25: number }>();
 
     // BM25 candidates
-    const family = project ? getProjectFamily(db, project) : [];
-    const episodeByRowid = project
-      ? db.prepare(`SELECT *, rowid FROM episodes WHERE rowid = ? AND (scope = 'global' OR project IN (${sqlInPlaceholders(family)}))`)
+    const familyPaths = project ? getProjectFamilyPaths(db, project) : [];
+    const episodeByRowid = familyPaths.length > 0
+      ? db.prepare(`SELECT *, rowid FROM episodes WHERE rowid = ? AND (scope = 'global' OR project_path IN (${sqlInPlaceholders(familyPaths)}))`)
       : db.prepare('SELECT *, rowid FROM episodes WHERE rowid = ?');
 
     for (const row of bm25Rows) {
       const episode = (
-        project
-          ? episodeByRowid.get(row.rowid, ...family)
+        familyPaths.length > 0
+          ? episodeByRowid.get(row.rowid, ...familyPaths)
           : episodeByRowid.get(row.rowid)
       ) as EpisodeRow | undefined;
       if (episode) {
@@ -724,10 +725,10 @@ async function handleMemoryRecall(args: {
 
     // Also fetch recent episodes with embeddings for vector-only matches
     const recentEpisodes = (
-      project
+      familyPaths.length > 0
         ? db.prepare(
-            `SELECT *, rowid FROM episodes WHERE embedding IS NOT NULL AND (scope = 'global' OR project IN (${sqlInPlaceholders(family)})) ORDER BY created_at DESC LIMIT ?`,
-          ).all(...family, candidateCount)
+            `SELECT *, rowid FROM episodes WHERE embedding IS NOT NULL AND (scope = 'global' OR project_path IN (${sqlInPlaceholders(familyPaths)})) ORDER BY created_at DESC LIMIT ?`,
+          ).all(...familyPaths, candidateCount)
         : db.prepare(
             'SELECT *, rowid FROM episodes WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT ?',
           ).all(candidateCount)
@@ -879,8 +880,8 @@ async function handleMemoryExpand(args: { id: string }) {
           isError: true,
         };
       }
-      const family = getProjectFamily(db, currentProject.name);
-      if (!family.includes(episode.project)) {
+      const familyPaths = getProjectFamilyPaths(db, currentProject.name);
+      if (!familyPaths.includes(episode.project_path ?? '')) {
         return {
           content: [
             {
@@ -974,8 +975,8 @@ async function handleMemoryForget(args: { id: string }) {
 
     // W3: Check episode exists AND enforce scope/project boundary
     const episode = db
-      .prepare('SELECT id, summary, scope, project FROM episodes WHERE id = ?')
-      .get(id) as { id: string; summary: string; scope: string; project: string | null } | undefined;
+      .prepare('SELECT id, summary, scope, project, project_path FROM episodes WHERE id = ?')
+      .get(id) as { id: string; summary: string; scope: string; project: string | null; project_path: string | null } | undefined;
 
     if (!episode) {
       return {
@@ -990,10 +991,7 @@ async function handleMemoryForget(args: { id: string }) {
 
     // W3 + C3: Scope/project boundary check — only allow deleting episodes
     // that are global or belong to the current project family.
-    // NOTE (C3): Comparison uses project basename only (episodes table stores basename).
-    // Two repos with identical basenames could theoretically cross-delete. A full fix
-    // requires a schema migration to store canonical project paths. Low practical risk
-    // since project names are typically unique within a user's workspace.
+    // Uses project_path for disambiguation (schema v7+).
     if (episode.scope === 'project' && episode.project) {
       const currentProject = detectProject();
       if (!currentProject) {
@@ -1007,8 +1005,8 @@ async function handleMemoryForget(args: { id: string }) {
           isError: true,
         };
       }
-      const family = getProjectFamily(db, currentProject.name);
-      if (!family.includes(episode.project)) {
+      const familyPaths = getProjectFamilyPaths(db, currentProject.name);
+      if (!familyPaths.includes(episode.project_path ?? '')) {
         return {
           content: [
             {

@@ -4,7 +4,7 @@ import os from 'node:os';
 import type { Database } from 'bun:sqlite';
 import { packEmbedding, cosineSimilarity } from '../mcp/embeddings.js';
 import type { EmbeddingProvider } from '../mcp/providers.js';
-import { getProjectFamily, sqlInPlaceholders } from '../shared/project-family.js';
+import { getProjectFamilyPaths, sqlInPlaceholders } from '../shared/project-family.js';
 
 // ---------------------------------------------------------------------------
 // Configurable topic-change threshold
@@ -159,16 +159,28 @@ export async function writeRecollections(
        LIMIT 200`,
     ).all() as EpisodeRow[];
   } else {
-    const family = getProjectFamily(db, projectName);
-    const placeholders = sqlInPlaceholders(family);
-    episodes = db.prepare(
-      `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
-       FROM episodes
-       WHERE (scope = 'global' OR project IN (${placeholders}))
-       AND embedding IS NOT NULL
-       ORDER BY accessed_at DESC
-       LIMIT 200`,
-    ).all(...family) as EpisodeRow[];
+    const familyPaths = getProjectFamilyPaths(db, projectName);
+    if (familyPaths.length === 0) {
+      // Fallback: unknown project — filter by project name for backward compat
+      episodes = db.prepare(
+        `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
+         FROM episodes
+         WHERE (scope = 'global' OR project = ?)
+         AND embedding IS NOT NULL
+         ORDER BY accessed_at DESC
+         LIMIT 200`,
+      ).all(projectName) as EpisodeRow[];
+    } else {
+      const placeholders = sqlInPlaceholders(familyPaths);
+      episodes = db.prepare(
+        `SELECT rowid, id, summary, importance, embedding, created_at, accessed_at, access_count
+         FROM episodes
+         WHERE (scope = 'global' OR project_path IN (${placeholders}))
+         AND embedding IS NOT NULL
+         ORDER BY accessed_at DESC
+         LIMIT 200`,
+      ).all(...familyPaths) as EpisodeRow[];
+    }
   }
 
   if (episodes.length === 0) {

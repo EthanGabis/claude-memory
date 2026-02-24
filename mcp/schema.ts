@@ -373,6 +373,82 @@ export function initDb(dbPath: string): Database {
     }
   }
 
+  // --- Schema version 7 migration: add project_path to episodes and chunks ---
+  const v7Row = db.query<{ value: string }, []>(
+    `SELECT value FROM _meta WHERE key = 'schema_version'`
+  ).get();
+  const v7Version = v7Row ? parseInt(v7Row.value, 10) : 1;
+
+  if (v7Version < 7) {
+    const runV7Migration = () => {
+      db.exec(`BEGIN EXCLUSIVE`);
+      try {
+        db.exec(`ALTER TABLE episodes ADD COLUMN project_path TEXT`);
+        db.exec(`ALTER TABLE chunks ADD COLUMN project_path TEXT`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_episodes_project_path ON episodes(project_path)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_project_path ON chunks(project_path)`);
+        db.exec(`
+          UPDATE episodes SET project_path = (
+            SELECT p.full_path FROM projects p WHERE p.name = episodes.project ORDER BY p.full_path LIMIT 1
+          ) WHERE project IS NOT NULL AND project_path IS NULL
+        `);
+        db.exec(`
+          UPDATE chunks SET project_path = (
+            SELECT p.full_path FROM projects p WHERE p.name = chunks.project ORDER BY p.full_path LIMIT 1
+          ) WHERE project IS NOT NULL AND project_path IS NULL
+        `);
+        db.exec(`UPDATE _meta SET value = '7' WHERE key = 'schema_version'`);
+        db.exec(`COMMIT`);
+      } catch (err) {
+        try { db.exec(`ROLLBACK`); } catch {}
+        if ((err as Error).message?.includes('duplicate column')) {
+          // Column(s) exist from a partial prior migration — add indexes, backfill, and bump version atomically
+          db.exec(`BEGIN EXCLUSIVE`);
+          try {
+            db.exec(`CREATE INDEX IF NOT EXISTS idx_episodes_project_path ON episodes(project_path)`);
+            db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_project_path ON chunks(project_path)`);
+            db.exec(`
+              UPDATE episodes SET project_path = (
+                SELECT p.full_path FROM projects p WHERE p.name = episodes.project ORDER BY p.full_path LIMIT 1
+              ) WHERE project IS NOT NULL AND project_path IS NULL
+            `);
+            db.exec(`
+              UPDATE chunks SET project_path = (
+                SELECT p.full_path FROM projects p WHERE p.name = chunks.project ORDER BY p.full_path LIMIT 1
+              ) WHERE project IS NOT NULL AND project_path IS NULL
+            `);
+            db.exec(`UPDATE _meta SET value = '7' WHERE key = 'schema_version'`);
+            db.exec(`COMMIT`);
+          } catch (innerErr) {
+            try { db.exec(`ROLLBACK`); } catch {}
+            throw innerErr;
+          }
+        } else {
+          throw err;
+        }
+      }
+    };
+
+    try {
+      runV7Migration();
+    } catch (err) {
+      if ((err as Error).message?.includes('SQLITE_BUSY') || (err as Error).message?.includes('database is locked')) {
+        console.error('[schema] v7 migration busy — retrying in 6s');
+        Bun.sleepSync(6000);
+        const recheck = db.query<{ value: string }, []>(
+          `SELECT value FROM _meta WHERE key = 'schema_version'`
+        ).get();
+        if (recheck && parseInt(recheck.value, 10) >= 7) {
+          console.error('[schema] v7 migration completed by other process');
+        } else {
+          runV7Migration();
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
   return db;
 }
 

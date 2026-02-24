@@ -12,7 +12,7 @@ import { resolveProjectFromJsonlPath } from '../shared/project-resolver.js';
 import { upsertProject, generateProjectDescription } from '../shared/project-describer.js';
 import { extractFilePathsFromJsonl, extractFilePathsFromSession } from '../shared/file-path-extractor.js';
 import { inferProjectFromPaths, PROJECT_MARKERS } from '../shared/project-inferrer.js';
-import { detectParentProject, invalidateFamilyCache } from '../shared/project-family.js';
+import { detectParentProject, detectParentsInMemory, invalidateFamilyCache } from '../shared/project-family.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -426,15 +426,17 @@ function runParentDetection(database: Database): void {
     `SELECT full_path, parent_project FROM projects`
   ).all() as { full_path: string; parent_project: string | null }[];
 
+  const detected = detectParentsInMemory(projects);
+
   let updated = 0;
   const updateStmt = database.prepare(
     `UPDATE projects SET parent_project = ? WHERE full_path = ?`
   );
 
   for (const row of projects) {
-    const detected = detectParentProject(database, row.full_path);
-    if (detected !== row.parent_project) {
-      updateStmt.run(detected, row.full_path);
+    const newParent = detected.get(row.full_path) ?? null;
+    if (newParent !== row.parent_project) {
+      updateStmt.run(newParent, row.full_path);
       updated++;
     }
   }

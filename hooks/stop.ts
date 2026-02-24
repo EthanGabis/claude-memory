@@ -331,7 +331,13 @@ async function main() {
   try {
     const projectName = findClaudeMemoryDir(cwd) ? path.basename(cwd) : undefined;
     const layer = projectName ? 'project' : 'global';
-    await indexFile(db, dailyLogPath, layer, projectName);
+    // Look up full_path from projects table for project_path
+    let projectFullPath: string | null = null;
+    if (projectName) {
+      const row = db.prepare('SELECT full_path FROM projects WHERE name = ? LIMIT 1').get(projectName) as { full_path: string } | undefined;
+      projectFullPath = row?.full_path ?? null;
+    }
+    await indexFile(db, dailyLogPath, layer, projectName, undefined, projectFullPath);
   } catch (err) {
     console.error('[stop-hook] Re-indexing failed:', (err as Error).message);
   } finally {

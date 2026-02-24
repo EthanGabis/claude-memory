@@ -4,6 +4,8 @@ import type { Database } from 'bun:sqlite';
 let familyCache: Map<string, string[]> | null = null;
 // Reverse lookup: project name → full_path (first match wins)
 let nameToPath: Map<string, string> | null = null;
+// Singleton family cache: full_path → family full_paths (self + all descendants)
+let pathFamilyCache: Map<string, string[]> | null = null;
 
 /**
  * Detect the immediate parent project by path-prefix matching.
@@ -31,15 +33,34 @@ export function detectParentProject(db: Database, fullPath: string): string | nu
  * Uses a lazy-built in-memory cache invalidated by invalidateFamilyCache().
  */
 export function getProjectFamily(db: Database, projectName: string): string[] {
-  if (!familyCache || !nameToPath) {
+  if (!familyCache || !nameToPath || !pathFamilyCache) {
     const result = buildFamilyCache(db);
     familyCache = result.byPath;
     nameToPath = result.nameToPath;
+    pathFamilyCache = result.pathFamily;
   }
   // Resolve name → full_path, then look up family
   const fullPath = nameToPath.get(projectName);
   if (!fullPath) return [projectName]; // Unknown project — return self only
   return familyCache.get(fullPath) ?? [projectName];
+}
+
+/**
+ * Get the full family of project full_paths for a given project.
+ * Returns [projectFullPath, ...all descendant full_paths].
+ * Returns [] if the project is unknown.
+ * Uses a lazy-built in-memory cache invalidated by invalidateFamilyCache().
+ */
+export function getProjectFamilyPaths(db: Database, projectName: string): string[] {
+  if (!familyCache || !nameToPath || !pathFamilyCache) {
+    const result = buildFamilyCache(db);
+    familyCache = result.byPath;
+    nameToPath = result.nameToPath;
+    pathFamilyCache = result.pathFamily;
+  }
+  const fullPath = nameToPath.get(projectName);
+  if (!fullPath) return [];
+  return pathFamilyCache.get(fullPath) ?? [];
 }
 
 /**
@@ -49,6 +70,7 @@ export function getProjectFamily(db: Database, projectName: string): string[] {
 export function invalidateFamilyCache(): void {
   familyCache = null;
   nameToPath = null;
+  pathFamilyCache = null;
 }
 
 /**
@@ -60,6 +82,58 @@ export function sqlInPlaceholders(values: string[]): string {
 }
 
 /**
+ * O(N²) in-memory parent detection. Sorts all projects by path length DESC
+ * and finds the immediate parent (deepest ancestor) for each project.
+ * Returns a Map<full_path, parent_full_path | null>.
+ */
+export function detectParentsInMemory(projects: { full_path: string }[]): Map<string, string | null> {
+  // Sort by path length DESC (deepest first)
+  const sorted = [...projects].sort((a, b) => b.full_path.length - a.full_path.length);
+  const result = new Map<string, string | null>();
+
+  for (const project of projects) {
+    let parent: string | null = null;
+    for (const candidate of sorted) {
+      if (candidate.full_path === project.full_path) continue;
+      if (project.full_path.startsWith(candidate.full_path + '/')) {
+        parent = candidate.full_path;
+        break; // First match is deepest ancestor = immediate parent
+      }
+    }
+    result.set(project.full_path, parent);
+  }
+  return result;
+}
+
+/**
+ * Generate an efficient SQL filter for a family of project names/paths.
+ * For small families (<=100), uses IN (...placeholders...).
+ * For large families, uses a temp table to avoid SQLite variable limits.
+ */
+export function sqlFamilyFilter(
+  db: Database,
+  family: string[],
+  column: string,
+): { clause: string; params: string[]; cleanup?: () => void } {
+  if (family.length <= 100) {
+    return {
+      clause: `${column} IN (${sqlInPlaceholders(family)})`,
+      params: family,
+    };
+  }
+  // Use temp table for large families
+  db.exec('CREATE TEMP TABLE IF NOT EXISTS _family_filter (val TEXT PRIMARY KEY)');
+  db.exec('DELETE FROM _family_filter');
+  const insert = db.prepare('INSERT OR IGNORE INTO _family_filter (val) VALUES (?)');
+  for (const v of family) insert.run(v);
+  return {
+    clause: `${column} IN (SELECT val FROM _family_filter)`,
+    params: [],
+    cleanup: () => db.exec('DELETE FROM _family_filter'),
+  };
+}
+
+/**
  * Build the family cache from the projects table.
  * Creates an adjacency list keyed by full_path, then BFS from each project
  * to compute the transitive closure of descendants.
@@ -67,9 +141,10 @@ export function sqlInPlaceholders(values: string[]): string {
 function buildFamilyCache(db: Database): {
   byPath: Map<string, string[]>;
   nameToPath: Map<string, string>;
+  pathFamily: Map<string, string[]>;
 } {
   const projects = db.prepare(
-    `SELECT name, full_path, parent_project FROM projects`
+    `SELECT name, full_path, parent_project FROM projects ORDER BY full_path`
   ).all() as { name: string; full_path: string; parent_project: string | null }[];
 
   // Build adjacency: parent_full_path → [child_full_path, ...]
@@ -79,7 +154,7 @@ function buildFamilyCache(db: Database): {
 
   for (const p of projects) {
     pathToName.set(p.full_path, p.name);
-    // First name wins (name collisions: keep the first-seen full_path)
+    // First name wins — deterministic because projects are ORDER BY full_path
     if (!nameToPathMap.has(p.name)) {
       nameToPathMap.set(p.name, p.full_path);
     }
@@ -90,24 +165,47 @@ function buildFamilyCache(db: Database): {
     }
   }
 
-  // For each project, BFS to compute all descendants
+  // For each project, BFS to compute all descendant names (with cycle guard)
   const byPath = new Map<string, string[]>();
   for (const p of projects) {
     const family = [p.name];
     const queue = [p.full_path];
+    const visited = new Set<string>([p.full_path]);
     while (queue.length > 0) {
       const current = queue.shift()!;
       const childPaths = childrenOf.get(current) ?? [];
       for (const childPath of childPaths) {
+        if (visited.has(childPath)) continue;
+        visited.add(childPath);
         const childName = pathToName.get(childPath);
         if (childName) {
           family.push(childName);
-          queue.push(childPath); // Continue BFS — no ambiguity
+          queue.push(childPath);
         }
       }
     }
     byPath.set(p.full_path, family);
   }
 
-  return { byPath, nameToPath: nameToPathMap };
+  // For each project, BFS to compute all descendant full_paths (with cycle guard)
+  const pathFamily = new Map<string, string[]>();
+  for (const p of projects) {
+    const familyPaths = [p.full_path];
+    const queue = [p.full_path];
+    const visited = new Set<string>([p.full_path]);
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      const childPaths = childrenOf.get(current) ?? [];
+      for (const childPath of childPaths) {
+        if (!visited.has(childPath)) {
+          visited.add(childPath);
+          familyPaths.push(childPath);
+          queue.push(childPath);
+        }
+      }
+    }
+    pathFamily.set(p.full_path, familyPaths);
+  }
+
+  return { byPath, nameToPath: nameToPathMap, pathFamily };
 }

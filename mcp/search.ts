@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite';
 import { cosineSimilarity } from './embeddings.js';
-import { getProjectFamily, sqlInPlaceholders } from '../shared/project-family.js';
+import { getProjectFamilyPaths, sqlInPlaceholders } from '../shared/project-family.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -27,6 +27,7 @@ interface ChunkRow {
   path: string;
   layer: 'global' | 'project';
   project: string | null;
+  project_path: string | null;
   start_line: number;
   end_line: number;
   text: string;
@@ -138,9 +139,9 @@ export function search(
 
   if (bm25Rows.length === 0) {
     // Vector-only fallback when FTS returns nothing
-    const family = project ? getProjectFamily(db, project) : [];
-    const allChunks = (family.length > 0
-      ? db.prepare(`SELECT * FROM chunks WHERE embedding IS NOT NULL AND (project IN (${sqlInPlaceholders(family)}) OR project IS NULL) ORDER BY updated_at DESC LIMIT ?`).all(...family, candidateCount)
+    const familyPaths = project ? getProjectFamilyPaths(db, project) : [];
+    const allChunks = (familyPaths.length > 0
+      ? db.prepare(`SELECT * FROM chunks WHERE embedding IS NOT NULL AND (project_path IN (${sqlInPlaceholders(familyPaths)}) OR project_path IS NULL) ORDER BY updated_at DESC LIMIT ?`).all(...familyPaths, candidateCount)
       : db.prepare('SELECT * FROM chunks WHERE embedding IS NOT NULL ORDER BY updated_at DESC LIMIT ?').all(candidateCount)
     ) as ChunkRow[];
 
@@ -171,9 +172,9 @@ export function search(
   }
 
   // 2. Fetch full chunk for each BM25 hit, optionally filtering by project family
-  const family = project ? getProjectFamily(db, project) : [];
-  const chunkStmt = family.length > 0
-    ? db.prepare(`SELECT * FROM chunks WHERE rowid = ? AND (project IN (${sqlInPlaceholders(family)}) OR project IS NULL)`)
+  const familyPaths = project ? getProjectFamilyPaths(db, project) : [];
+  const chunkStmt = familyPaths.length > 0
+    ? db.prepare(`SELECT * FROM chunks WHERE rowid = ? AND (project_path IN (${sqlInPlaceholders(familyPaths)}) OR project_path IS NULL)`)
     : db.prepare('SELECT * FROM chunks WHERE rowid = ?');
 
   interface ScoredCandidate {
@@ -186,8 +187,8 @@ export function search(
 
   for (const row of bm25Rows) {
     const chunk = (
-      family.length > 0
-        ? chunkStmt.get(row.rowid, ...family)
+      familyPaths.length > 0
+        ? chunkStmt.get(row.rowid, ...familyPaths)
         : chunkStmt.get(row.rowid)
     ) as ChunkRow | undefined;
 

@@ -125,10 +125,17 @@ export function startWatcher(
 
     const { layer, project } = detectLayerAndProject(changedPath);
 
+    // Look up full_path from projects table for project_path
+    let projectFullPath: string | null = null;
+    if (project) {
+      const row = db.prepare('SELECT full_path FROM projects WHERE name = ? LIMIT 1').get(project) as { full_path: string } | undefined;
+      projectFullPath = row?.full_path ?? null;
+    }
+
     try {
       // Dynamic import to avoid potential circular dep at module load time
       const { indexFile } = await import('./indexer.js');
-      await indexFile(db, changedPath, layer, project, provider ?? undefined);
+      await indexFile(db, changedPath, layer, project, provider ?? undefined, projectFullPath);
     } catch (err) {
       console.error('[watcher] re-index failed for', changedPath, (err as Error).message);
     }

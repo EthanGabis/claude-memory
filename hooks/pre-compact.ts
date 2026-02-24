@@ -252,7 +252,13 @@ async function main(): Promise<void> {
   try {
     const isGlobal = memoryDir.startsWith(path.join(os.homedir(), '.claude-memory'));
     const projectName = isGlobal ? undefined : path.basename(cwd);
-    await indexFile(db, dailyLogPath, isGlobal ? 'global' : 'project', projectName);
+    // Look up full_path from projects table for project_path
+    let projectFullPath: string | null = null;
+    if (projectName) {
+      const row = db.prepare('SELECT full_path FROM projects WHERE name = ? LIMIT 1').get(projectName) as { full_path: string } | undefined;
+      projectFullPath = row?.full_path ?? null;
+    }
+    await indexFile(db, dailyLogPath, isGlobal ? 'global' : 'project', projectName, undefined, projectFullPath);
   } catch (err) {
     console.error('[pre-compact] re-index failed:', (err as Error).message);
   } finally {

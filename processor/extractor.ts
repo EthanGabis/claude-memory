@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { packEmbedding, cosineSimilarity } from '../mcp/embeddings.js';
 import type { EmbeddingProvider } from '../mcp/providers.js';
 import type { Database } from 'bun:sqlite';
-import { getProjectFamily, sqlInPlaceholders } from '../shared/project-family.js';
+import { getProjectFamilyPaths, sqlInPlaceholders } from '../shared/project-family.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -172,16 +172,27 @@ export function fetchEpisodeSnapshot(db: Database, projectName: string | null): 
        LIMIT 500`,
     ).all() as EpisodeRow[];
   }
-  const family = getProjectFamily(db, projectName);
-  const placeholders = sqlInPlaceholders(family);
+  const familyPaths = getProjectFamilyPaths(db, projectName);
+  if (familyPaths.length === 0) {
+    // Fallback: unknown project — filter by project name for backward compat
+    return db.prepare(
+      `SELECT id, summary, full_content, entities, embedding, access_count, scope, project
+       FROM episodes
+       WHERE (scope = 'global' OR project = ?)
+       AND embedding IS NOT NULL
+       ORDER BY accessed_at DESC
+       LIMIT 500`,
+    ).all(projectName) as EpisodeRow[];
+  }
+  const placeholders = sqlInPlaceholders(familyPaths);
   return db.prepare(
     `SELECT id, summary, full_content, entities, embedding, access_count, scope, project
      FROM episodes
-     WHERE (scope = 'global' OR project IN (${placeholders}))
+     WHERE (scope = 'global' OR project_path IN (${placeholders}))
      AND embedding IS NOT NULL
      ORDER BY accessed_at DESC
      LIMIT 500`,
-  ).all(...family) as EpisodeRow[];
+  ).all(...familyPaths) as EpisodeRow[];
 }
 
 export interface UpsertResult {
@@ -209,8 +220,8 @@ function getStatements(db: Database) {
          WHERE id = ?`,
       ),
       insert: db.prepare(
-        `INSERT INTO episodes (id, session_id, project, scope, summary, entities, importance, source_type, full_content, embedding, created_at, accessed_at, access_count)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'auto', ?, ?, ?, ?, 0)`,
+        `INSERT INTO episodes (id, session_id, project, project_path, scope, summary, entities, importance, source_type, full_content, embedding, created_at, accessed_at, access_count)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'auto', ?, ?, ?, ?, 0)`,
       ),
     };
     stmtCache.set(db, stmts);
@@ -238,6 +249,7 @@ export async function upsertEpisode(
   db: Database,
   existingRows: EpisodeRow[],
   precomputedEmbedding?: Buffer | null,
+  projectPath?: string | null,
 ): Promise<UpsertResult> {
   // W6: Use precomputed embedding if available, otherwise embed individually (fallback)
   let candidateBlob: Buffer;
@@ -322,6 +334,7 @@ export async function upsertEpisode(
     id,
     sessionId,
     effectiveScope === 'project' ? projectName : null,
+    effectiveScope === 'project' ? (projectPath ?? null) : null,
     effectiveScope,
     candidate.summary,
     JSON.stringify(candidate.entities),

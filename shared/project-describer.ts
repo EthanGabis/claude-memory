@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Database } from 'bun:sqlite';
-import { getProjectFamily, sqlInPlaceholders } from './project-family.js';
+import { getProjectFamilyPaths, sqlInPlaceholders } from './project-family.js';
 
 interface ProjectRow {
   name: string;
@@ -78,14 +78,25 @@ export async function generateProjectDescription(
   }
 
   // Strategy 2: Summarize from recent episodes (family-aware: includes child projects)
-  const family = getProjectFamily(db, projectName);
-  const placeholders = sqlInPlaceholders(family);
-  const episodes = db.prepare(`
-    SELECT summary FROM episodes
-    WHERE project IN (${placeholders})
-    ORDER BY created_at DESC
-    LIMIT 10
-  `).all(...family) as { summary: string }[];
+  const familyPaths = getProjectFamilyPaths(db, projectName);
+  let episodes: { summary: string }[];
+  if (familyPaths.length === 0) {
+    // Fallback: unknown project — filter by project name for backward compat
+    episodes = db.prepare(`
+      SELECT summary FROM episodes
+      WHERE project = ?
+      ORDER BY created_at DESC
+      LIMIT 10
+    `).all(projectName) as { summary: string }[];
+  } else {
+    const placeholders = sqlInPlaceholders(familyPaths);
+    episodes = db.prepare(`
+      SELECT summary FROM episodes
+      WHERE project_path IN (${placeholders})
+      ORDER BY created_at DESC
+      LIMIT 10
+    `).all(...familyPaths) as { summary: string }[];
+  }
 
   if (episodes.length >= 3) {
     const episodeSummaries = episodes.map(e => `- ${e.summary}`).join('\n');

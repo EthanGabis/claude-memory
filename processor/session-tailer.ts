@@ -75,6 +75,7 @@ export class SessionTailer {
   private embedProvider: EmbeddingProvider;
   private db: Database;
   private projectName: string | null;
+  private projectPath: string | null;
   private projectIsRoot: boolean;
   private llmApiKey: string;
 
@@ -123,6 +124,7 @@ export class SessionTailer {
     // If projectInfo provided, use it for project name; otherwise fall back to path-based detection
     if (projectInfo) {
       this.projectName = projectInfo.name;
+      this.projectPath = projectInfo.fullPath ?? null;
       this.projectIsRoot = projectInfo.isRoot;
     } else {
       // Fallback: extract from path (existing behavior)
@@ -131,6 +133,7 @@ export class SessionTailer {
       this.projectName = projectsIdx >= 0 && projectsIdx + 1 < parts.length
         ? parts[projectsIdx + 1]
         : null;
+      this.projectPath = null;
       this.projectIsRoot = false;
     }
   }
@@ -393,6 +396,7 @@ export class SessionTailer {
     const oldProject = this.projectName;
     const oldIsRoot = this.projectIsRoot;
     this.projectName = inferred.name;
+    this.projectPath = inferred.fullPath ?? null;
     this.projectIsRoot = false;
 
     // Invalidate resolver cache so future reads get the corrected project
@@ -504,6 +508,7 @@ export class SessionTailer {
               this.db,
               episodeSnapshot,
               candidateEmbeddings[i],
+              this.projectPath,
             );
             if (upsertResult.action === 'add') {
               added++;
