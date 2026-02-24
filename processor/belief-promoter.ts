@@ -264,9 +264,10 @@ export async function promoteBeliefs(db: Database): Promise<PromotionResult> {
     const memoryPath = resolveMemoryPath(targetPath);
     const lockPath = memoryPath + '.lock';
 
+    // Ensure directory exists BEFORE acquiring lock (lock creation needs the dir)
+    await fs.mkdir(path.dirname(memoryPath), { recursive: true });
+
     await withFileLock(lockPath, async () => {
-      // Ensure directory exists
-      await fs.mkdir(path.dirname(memoryPath), { recursive: true });
 
       let existing = '';
       try {
