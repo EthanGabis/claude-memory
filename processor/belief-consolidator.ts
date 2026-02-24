@@ -48,10 +48,25 @@ interface BeliefCandidate {
 
 interface Cluster {
   centroid: Float32Array;
+  sum: Float32Array;
   episodes: EpisodeRow[];
 }
 
 type Classification = 'SUPPORTS' | 'CONTRADICTS' | 'PARTIAL' | 'IRRELEVANT';
+
+// ---------------------------------------------------------------------------
+// Safe JSON.parse wrappers
+// ---------------------------------------------------------------------------
+
+function safeParseArray(json: string): string[] {
+  try { return JSON.parse(json); }
+  catch { return []; }
+}
+
+function safeParseJson(json: string): any {
+  try { return JSON.parse(json); }
+  catch { return []; }
+}
 
 // ---------------------------------------------------------------------------
 // Prompts
@@ -183,6 +198,9 @@ export async function runBeliefConsolidation(
   const partialAccumulator = new Map<string, number>(); // beliefId -> count of PARTIAL classifications this cycle
   const processedEpisodeIds = new Set<string>(); // Track which episodes were actually processed
 
+  // Load active beliefs ONCE before the loop to avoid N+1 queries
+  let cachedActiveBeliefs = loadActiveBeliefs(db);
+
   for (const cluster of clustersToProcess) {
     if (budgetExceeded(cycleStart)) {
       log('Budget exceeded — saving progress');
@@ -193,9 +211,14 @@ export async function runBeliefConsolidation(
       const candidate = await synthesizeCluster(cluster, openai, embedProvider, log);
       if (!candidate) continue;
 
-      await matchCandidate(
+      const mutated = await matchCandidate(
         db, openai, candidate, candidatesForRevision, partialAccumulator, cycleStart, log,
+        cachedActiveBeliefs,
       );
+      // Reload active beliefs after any DB mutation to stay fresh
+      if (mutated) {
+        cachedActiveBeliefs = loadActiveBeliefs(db);
+      }
       // Mark these episodes as processed (only after successful synthesis+match)
       for (const id of candidate.episodeIds) processedEpisodeIds.add(id);
     } catch (err) {
@@ -291,11 +314,16 @@ function clusterEpisodes(episodes: EpisodeRow[]): Cluster[] {
 
     if (bestCluster && bestSim > BELIEF_CONFIG.CLUSTER_SIMILARITY_THRESHOLD) {
       bestCluster.episodes.push(ep);
-      // Update centroid (running average)
+      // Incremental centroid update: add to running sum, recompute centroid
+      for (let i = 0; i < vec.length; i++) {
+        bestCluster.sum[i] += vec[i];
+      }
       updateCentroid(bestCluster);
     } else {
+      const sum = new Float32Array(vec);
       clusters.push({
         centroid: new Float32Array(vec),
+        sum,
         episodes: [ep],
       });
     }
@@ -304,24 +332,13 @@ function clusterEpisodes(episodes: EpisodeRow[]): Cluster[] {
   return clusters;
 }
 
+/** Recompute centroid from running sum (O(dim) instead of O(n*dim)) */
 function updateCentroid(cluster: Cluster): void {
   const dim = cluster.centroid.length;
-  const avg = new Float32Array(dim);
-
-  for (const ep of cluster.episodes) {
-    if (!ep.embedding) continue;
-    const vec = unpackEmbedding(ep.embedding as Buffer);
-    for (let i = 0; i < dim; i++) {
-      avg[i] += vec[i];
-    }
-  }
-
   const n = cluster.episodes.length;
   for (let i = 0; i < dim; i++) {
-    avg[i] /= n;
+    cluster.centroid[i] = cluster.sum[i] / n;
   }
-
-  cluster.centroid = avg;
 }
 
 /** Cosine similarity on raw Float32Arrays (avoids Buffer packing/unpacking overhead) */
@@ -424,6 +441,13 @@ async function synthesizeCluster(
 // Matching — compare candidate against existing beliefs
 // ---------------------------------------------------------------------------
 
+/** Load all active beliefs with embeddings from DB */
+function loadActiveBeliefs(db: Database): Belief[] {
+  return db.query<Belief, []>(`
+    SELECT * FROM beliefs WHERE status = 'active' AND embedding IS NOT NULL
+  `).all();
+}
+
 async function matchCandidate(
   db: Database,
   openai: OpenAI,
@@ -432,18 +456,25 @@ async function matchCandidate(
   partialAccumulator: Map<string, number>,
   cycleStart: number,
   log: (msg: string) => void,
-): Promise<void> {
+  allActiveBeliefs: Belief[],
+): Promise<boolean> {
   const now = Date.now();
+  let mutated = false;
 
-  // Load all active beliefs with embeddings
-  const activeBeliefs = db.query<Belief, []>(`
-    SELECT * FROM beliefs WHERE status = 'active' AND embedding IS NOT NULL
-  `).all();
+  // Scope-aware filtering to prevent cross-project reinforcement
+  let activeBeliefs: Belief[];
+  if (candidate.scope === 'project' && candidate.project) {
+    activeBeliefs = allActiveBeliefs.filter(
+      b => b.scope === 'global' || b.project === candidate.project,
+    );
+  } else {
+    activeBeliefs = allActiveBeliefs;
+  }
 
   if (activeBeliefs.length === 0) {
     // No existing beliefs — this is a novel belief
     createNewBelief(db, candidate, now, log);
-    return;
+    return true;
   }
 
   // Compute similarities
@@ -461,7 +492,7 @@ async function matchCandidate(
   // Case 1: cosine > REINFORCE_THRESHOLD → REINFORCE directly
   if (top.sim > BELIEF_CONFIG.REINFORCE_THRESHOLD) {
     reinforceBelief(db, top.belief, candidate.episodeIds, now, log);
-    return;
+    return true;
   }
 
   // Case 2: cosine > RELATED_THRESHOLD → run classification
@@ -481,6 +512,7 @@ async function matchCandidate(
         case 'SUPPORTS':
           reinforceBelief(db, belief, candidate.episodeIds, now, log);
           matched = true;
+          mutated = true;
           break;
 
         case 'CONTRADICTS': {
@@ -488,12 +520,13 @@ async function matchCandidate(
           contradictBelief(db, belief, candidate.episodeIds, now, log);
           candidatesForRevision.push({ beliefId: belief.id, previousConfidence });
           matched = true;
+          mutated = true;
           break;
         }
 
         case 'PARTIAL': {
           // Log to contradicting_episodes with PARTIAL flag, and weakly update both alpha and beta
-          const contradicting: string[] = JSON.parse(belief.contradicting_episodes);
+          const contradicting: string[] = safeParseArray(belief.contradicting_episodes);
           const newContradicting = [...contradicting, ...candidate.episodeIds.map(id => `PARTIAL:${id}`)];
           db.query(`
             UPDATE beliefs SET
@@ -507,6 +540,7 @@ async function matchCandidate(
 
           partialAccumulator.set(belief.id, (partialAccumulator.get(belief.id) ?? 0) + 1);
           matched = true;
+          mutated = true;
           break;
         }
 
@@ -521,12 +555,14 @@ async function matchCandidate(
     // If no classification matched, treat as novel
     if (!matched) {
       createNewBelief(db, candidate, now, log);
+      mutated = true;
     }
-    return;
+    return mutated;
   }
 
   // Case 3: cosine < RELATED_THRESHOLD → NOVEL
   createNewBelief(db, candidate, now, log);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -580,7 +616,7 @@ function reinforceBelief(
   now: number,
   log: (msg: string) => void,
 ): void {
-  const supporting: string[] = JSON.parse(belief.supporting_episodes);
+  const supporting: string[] = safeParseArray(belief.supporting_episodes);
   const newSupporting = [...supporting, ...episodeIds.filter(id => !supporting.includes(id))];
 
   db.query(`
@@ -603,7 +639,7 @@ function contradictBelief(
   now: number,
   log: (msg: string) => void,
 ): void {
-  const contradicting: string[] = JSON.parse(belief.contradicting_episodes);
+  const contradicting: string[] = safeParseArray(belief.contradicting_episodes);
   const newContradicting = [...contradicting, ...episodeIds.filter(id => !contradicting.includes(id))];
 
   db.query(`
@@ -664,7 +700,7 @@ async function checkAndRevise(
   const belief = db.query<Belief, [string]>(`SELECT * FROM beliefs WHERE id = ?`).get(beliefId);
   if (!belief || belief.status !== 'active') return;
 
-  const contradicting: string[] = JSON.parse(belief.contradicting_episodes);
+  const contradicting: string[] = safeParseArray(belief.contradicting_episodes);
   // Filter out PARTIAL-prefixed entries for revision check
   const pureContradictions = contradicting.filter(id => !id.startsWith('PARTIAL:'));
 
@@ -711,7 +747,7 @@ async function checkAndRevise(
 
   // Create new belief with revised statement
   const newId = generateBeliefId();
-  const revisionHistory: Array<{ timestamp: number; old_statement: string; old_confidence: number; reason: string }> = JSON.parse(belief.revision_history);
+  const revisionHistory: Array<{ timestamp: number; old_statement: string; old_confidence: number; reason: string }> = safeParseJson(belief.revision_history);
   revisionHistory.push({
     timestamp: now,
     old_statement: belief.statement,
@@ -719,7 +755,7 @@ async function checkAndRevise(
     reason: parsed.reason,
   });
 
-  db.exec('BEGIN TRANSACTION');
+  db.exec('BEGIN IMMEDIATE');
   try {
     // Create new revised belief — inherit alpha/beta from old belief to preserve confidence history
     db.query(`
@@ -754,7 +790,7 @@ async function checkAndRevise(
     );
 
     // Update old belief: status → revised, link child
-    const childIds: string[] = JSON.parse(belief.child_belief_ids);
+    const childIds: string[] = safeParseArray(belief.child_belief_ids);
     childIds.push(newId);
     db.query(`
       UPDATE beliefs SET status = 'revised', child_belief_ids = ?, updated_at = ? WHERE id = ?
@@ -782,8 +818,8 @@ async function checkAndSplit(
   const belief = db.query<Belief, [string]>(`SELECT * FROM beliefs WHERE id = ?`).get(beliefId);
   if (!belief || belief.status !== 'active') return;
 
-  const supporting: string[] = JSON.parse(belief.supporting_episodes);
-  const contradicting: string[] = JSON.parse(belief.contradicting_episodes);
+  const supporting: string[] = safeParseArray(belief.supporting_episodes);
+  const contradicting: string[] = safeParseArray(belief.contradicting_episodes);
   // Count PARTIAL episodes only from the stored contradicting_episodes list.
   // partialCountThisCycle tracks classifications that were ALREADY written as
   // PARTIAL:-prefixed entries in contradicting_episodes, so adding both would
@@ -847,7 +883,7 @@ async function checkAndSplit(
   const idA = generateBeliefId();
   const idB = generateBeliefId();
 
-  db.exec('BEGIN TRANSACTION');
+  db.exec('BEGIN IMMEDIATE');
   try {
     // Create variant A — inherits supporting_episodes and evidence_count from original
     db.query(`
@@ -902,7 +938,7 @@ async function checkAndSplit(
     );
 
     // Update original: status → split, link children
-    const childIds: string[] = JSON.parse(belief.child_belief_ids);
+    const childIds: string[] = safeParseArray(belief.child_belief_ids);
     childIds.push(idA, idB);
     db.query(`
       UPDATE beliefs SET status = 'split', child_belief_ids = ?, updated_at = ? WHERE id = ?
@@ -974,19 +1010,19 @@ async function checkAndMerge(
       const newId = generateBeliefId();
 
       // Merge supporting/contradicting episodes
-      const supportA: string[] = JSON.parse(a.supporting_episodes);
-      const supportB: string[] = JSON.parse(b.supporting_episodes);
+      const supportA: string[] = safeParseArray(a.supporting_episodes);
+      const supportB: string[] = safeParseArray(b.supporting_episodes);
       const mergedSupporting = [...new Set([...supportA, ...supportB])];
 
-      const contradictA: string[] = JSON.parse(a.contradicting_episodes);
-      const contradictB: string[] = JSON.parse(b.contradicting_episodes);
+      const contradictA: string[] = safeParseArray(a.contradicting_episodes);
+      const contradictB: string[] = safeParseArray(b.contradicting_episodes);
       const mergedContradicting = [...new Set([...contradictA, ...contradictB])];
 
       // Merge confidence: combine alpha and beta counts
       const mergedAlpha = Math.max(1, a.confidence_alpha + b.confidence_alpha - 1); // subtract one prior
       const mergedBeta = Math.max(1, a.confidence_beta + b.confidence_beta - 1);
 
-      db.exec('BEGIN TRANSACTION');
+      db.exec('BEGIN IMMEDIATE');
       try {
         db.query(`
           INSERT INTO beliefs (
@@ -1021,7 +1057,7 @@ async function checkAndMerge(
 
         // Update both originals: status → merged, link child
         for (const original of [a, b]) {
-          const childIds: string[] = JSON.parse(original.child_belief_ids);
+          const childIds: string[] = safeParseArray(original.child_belief_ids);
           childIds.push(newId);
           db.query(`
             UPDATE beliefs SET status = 'merged', child_belief_ids = ?, updated_at = ? WHERE id = ?

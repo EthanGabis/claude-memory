@@ -1089,7 +1089,7 @@ function handleBeliefExpand(id: string) {
   if (revisionHistory.length > 0) {
     revisionStr = revisionHistory.map((r: any) => {
       const date = new Date(r.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      return `  - ${date}: "${r.old_statement}" (confidence: ${r.old_confidence?.toFixed(2) ?? '?'}) — ${r.reason}`;
+      return `  - ${date}: "${r.old_statement}" (confidence: ${typeof r.old_confidence === 'number' ? r.old_confidence.toFixed(2) : '?'}) — ${r.reason}`;
     }).join('\n');
   }
 
@@ -1151,8 +1151,8 @@ async function handleMemoryForget(args: { id: string }) {
     // Handle belief deletion
     if (id.startsWith('bl_')) {
       const belief = db
-        .prepare('SELECT id, statement FROM beliefs WHERE id = ?')
-        .get(id) as { id: string; statement: string } | undefined;
+        .prepare('SELECT * FROM beliefs WHERE id = ?')
+        .get(id) as Belief | undefined;
 
       if (!belief) {
         return {
@@ -1160,8 +1160,39 @@ async function handleMemoryForget(args: { id: string }) {
         };
       }
 
-      // Delete from beliefs table — triggers handle FTS cleanup
-      db.prepare('DELETE FROM beliefs WHERE id = ?').run(id);
+      // Clean up parent/child references in a transaction
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        // If this belief has a parent, remove this id from parent's child_belief_ids
+        if (belief.parent_belief_id) {
+          const parent = db.prepare('SELECT child_belief_ids FROM beliefs WHERE id = ?')
+            .get(belief.parent_belief_id) as { child_belief_ids: string } | undefined;
+          if (parent) {
+            let childIds: string[];
+            try { childIds = JSON.parse(parent.child_belief_ids); } catch { childIds = []; }
+            const filtered = childIds.filter((cid: string) => cid !== id);
+            db.prepare('UPDATE beliefs SET child_belief_ids = ? WHERE id = ?')
+              .run(JSON.stringify(filtered), belief.parent_belief_id);
+          }
+        }
+
+        // If this belief has children, set their parent_belief_id to null
+        let childIds: string[];
+        try { childIds = JSON.parse(belief.child_belief_ids); } catch { childIds = []; }
+        if (childIds.length > 0) {
+          const placeholders = childIds.map(() => '?').join(',');
+          db.prepare(`UPDATE beliefs SET parent_belief_id = NULL WHERE id IN (${placeholders})`)
+            .run(...childIds);
+        }
+
+        // Delete from beliefs table — triggers handle FTS cleanup
+        db.prepare('DELETE FROM beliefs WHERE id = ?').run(id);
+
+        db.exec('COMMIT');
+      } catch (err) {
+        try { db.exec('ROLLBACK'); } catch {}
+        throw err;
+      }
 
       return {
         content: [{ type: 'text' as const, text: `Deleted belief: "${belief.statement}" (${id})` }],
@@ -1349,8 +1380,8 @@ async function handleMemoryStatus() {
       beliefTotal = beliefTotalRow.cnt;
       const beliefActiveRow = db.prepare("SELECT COUNT(*) as cnt FROM beliefs WHERE status = 'active'").get() as { cnt: number };
       beliefActive = beliefActiveRow.cnt;
-    } catch {
-      // beliefs table may not exist yet on older schemas
+    } catch (err) {
+      console.error(`[memory_status] Belief count query failed: ${(err as Error).message}`);
     }
 
     // 3. Chunk count

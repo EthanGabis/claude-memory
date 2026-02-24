@@ -591,6 +591,10 @@ export class SessionTailer {
         this.extractionBackoff = this.extractionBackoff === 0
           ? 15_000
           : Math.min(this.extractionBackoff * 2, 120_000);
+        // Cap per-chunk path cache to prevent unbounded growth during persistent failures
+        if (this.filePathsSinceLastExtraction.size > 1000) {
+          this.filePathsSinceLastExtraction.clear();
+        }
         console.error(`[tailer:${this.sessionId.slice(0, 8)}] Extraction failed, retry in ${this.extractionBackoff / 1000}s: ${(err as Error).message}`);
       }
       } finally {

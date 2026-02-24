@@ -4,7 +4,7 @@ import { randomUUID } from 'crypto';
 
 /** Generate a belief ID in the same format as episode IDs */
 export function generateBeliefId(): string {
-  return 'bl_' + randomUUID().replace(/-/g, '').slice(0, 12);
+  return 'bl_' + randomUUID().replace(/-/g, '').slice(0, 20);
 }
 
 /** Compute confidence as mean of Beta(alpha, beta) distribution */
