@@ -106,6 +106,9 @@ export class SessionTailer {
   private hasReResolved = false;
   private readonly RE_RESOLVE_PATH_THRESHOLD = 5;
 
+  // Per-chunk project inference: tracks file paths since last extraction
+  private filePathsSinceLastExtraction = new Set<string>();
+
   constructor(
     jsonlPath: string,
     stateStore: StateStore,
@@ -302,11 +305,16 @@ export class SessionTailer {
 
     // --- Live re-resolution: track file paths from tool_use blocks ---
     // IMPORTANT: Must run BEFORE content check -- tool_use-only entries have null content
-    if (type === 'assistant' && !this.hasReResolved) {
+    if (type === 'assistant') {
       const paths = extractFilePathsFromEntry(entry);
-      for (const p of paths) this.observedFilePaths.add(p);
-      if (this.observedFilePaths.size >= this.RE_RESOLVE_PATH_THRESHOLD) {
-        this.attemptReResolution();
+      // Always track per-chunk paths for chunk-level project inference
+      for (const p of paths) this.filePathsSinceLastExtraction.add(p);
+      // Session-level re-resolution (only once)
+      if (!this.hasReResolved) {
+        for (const p of paths) this.observedFilePaths.add(p);
+        if (this.observedFilePaths.size >= this.RE_RESOLVE_PATH_THRESHOLD) {
+          this.attemptReResolution();
+        }
       }
     }
 
@@ -401,9 +409,9 @@ export class SessionTailer {
     // Re-scope already-extracted global episodes from this session
     try {
       const result = this.db.prepare(
-        `UPDATE episodes SET project = ?, scope = 'project'
+        `UPDATE episodes SET project = ?, project_path = ?, scope = 'project'
          WHERE session_id = ? AND scope = 'global'`
-      ).run(inferred.name, this.sessionId);
+      ).run(inferred.name, inferred.fullPath ?? null, this.sessionId);
       const changes = (result as any).changes ?? 0;
       if (changes > 0) {
         console.error(
@@ -455,18 +463,36 @@ export class SessionTailer {
         content: m.content,
       }));
 
+      // Per-chunk project inference: if session is from a root/parent directory,
+      // infer which child project this chunk references from file paths
+      let chunkProjectName = this.projectName;
+      let chunkProjectPath = this.projectPath;
+      let chunkIsRoot = this.projectIsRoot;
+
+      if (this.projectIsRoot && this.filePathsSinceLastExtraction.size >= 2) {
+        const inferred = inferProjectFromPaths([...this.filePathsSinceLastExtraction]);
+        if (inferred && inferred.name && inferred.fullPath && !inferred.isRoot) {
+          chunkProjectName = inferred.name;
+          chunkProjectPath = inferred.fullPath;
+          chunkIsRoot = false;
+          console.error(
+            `[tailer:${this.sessionId.slice(0, 8)}] Chunk inferred project: "${inferred.name}"`
+          );
+        }
+      }
+
       console.error(`[tailer:${this.sessionId.slice(0, 8)}] Extracting from ${messages.length} messages`);
 
       try {
         const result = await extractMemories(
           state.rollingSummary,
           messages,
-          this.projectName,
+          chunkProjectName,
           this.llmApiKey,
-          this.projectIsRoot,
+          chunkIsRoot,
         );
 
-        const episodeSnapshot = fetchEpisodeSnapshot(this.db, this.projectName);
+        const episodeSnapshot = fetchEpisodeSnapshot(this.db, chunkProjectName);
 
         // W6: Batch-embed all candidate summaries in one call (avoids N+1)
         let candidateEmbeddings: (Buffer | null)[] = [];
@@ -485,22 +511,22 @@ export class SessionTailer {
             const upsertResult = await upsertEpisode(
               candidate,
               this.sessionId,
-              this.projectName,
-              this.projectIsRoot,
+              chunkProjectName,
+              chunkIsRoot,
               this.embedProvider,
               this.db,
               episodeSnapshot,
               candidateEmbeddings[i],
-              this.projectPath,
+              chunkProjectPath,
             );
             if (upsertResult.action === 'add') {
               added++;
               if (upsertResult.embedding) {
                 let effectiveScope = candidate.scope;
-                if (this.projectName && !this.projectIsRoot && candidate.scope === 'global') {
+                if (chunkProjectName && !chunkIsRoot && candidate.scope === 'global') {
                   effectiveScope = 'project';
                 }
-                if (!this.projectName || this.projectIsRoot) {
+                if (!chunkProjectName || chunkIsRoot) {
                   effectiveScope = 'global';
                 }
                 episodeSnapshot.push({
@@ -511,7 +537,7 @@ export class SessionTailer {
                   embedding: upsertResult.embedding,
                   access_count: 0,
                   scope: effectiveScope,
-                  project: effectiveScope === 'project' ? this.projectName : null,
+                  project: effectiveScope === 'project' ? chunkProjectName : null,
                 });
               }
             }
@@ -552,6 +578,7 @@ export class SessionTailer {
         // SUCCESS: reset backoff, splice only processed messages (Fix #2)
         this.extractionBackoff = 0;
         this.extractionBuffer.splice(0, bufferLen);
+        this.filePathsSinceLastExtraction.clear();
         this.hasExtractedOnce = true;
         this.stateStore.updateSession(this.sessionId, {
           lastExtractedAt: Date.now(),

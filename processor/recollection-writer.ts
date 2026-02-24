@@ -4,6 +4,8 @@ import os from 'node:os';
 import type { Database } from 'bun:sqlite';
 import { packEmbedding, cosineSimilarity } from '../mcp/embeddings.js';
 import type { EmbeddingProvider } from '../mcp/providers.js';
+import type { Belief } from '../mcp/schema.js';
+import { beliefConfidence, retrievalStrength, BELIEF_CONFIG } from './belief-utils.js';
 
 // ---------------------------------------------------------------------------
 // Configurable topic-change threshold
@@ -30,6 +32,7 @@ interface MemoryBite {
   bite: string;
   date: number;
   importance: string;
+  type?: 'episode' | 'belief';
 }
 
 interface RecollectionFile {
@@ -320,7 +323,17 @@ export async function writeRecollections(
     bite: `[Memory flash: ${s.episode.summary}]`,
     date: s.episode.created_at,
     importance: s.episode.importance,
+    type: 'episode' as const,
   }));
+
+  // 5b. Belief blending — query beliefs and append top belief bites
+  try {
+    const beliefBites = scoreAndFormatBeliefs(db, ftsQuery, queryBlob, now, projectName);
+    bites.push(...beliefBites);
+  } catch (err) {
+    console.error(`[recollection] Belief blending failed: ${(err as Error).message}`);
+    // Non-fatal — continue with episode-only bites
+  }
 
   // 5. Atomic write to recollection file
   writeRecollectionFile(sessionId, userMessageUuid, bites);
@@ -335,6 +348,116 @@ export async function writeRecollections(
   }
 
   return { embedding: currentEmbedding };
+}
+
+// ---------------------------------------------------------------------------
+// Belief blending — score and format belief bites for recollection output
+// ---------------------------------------------------------------------------
+
+interface BeliefBM25Row {
+  rowid: number;
+  score: number;
+}
+
+function scoreAndFormatBeliefs(
+  db: Database,
+  ftsQuery: string,
+  queryBlob: Buffer,
+  now: number,
+  projectName: string | null,
+): MemoryBite[] {
+  // 1. BM25 search on beliefs_fts
+  const bm25Map = new Map<number, number>();
+  if (ftsQuery.length > 0) {
+    try {
+      const bm25Rows = db.prepare(
+        'SELECT rowid, bm25(beliefs_fts) as score FROM beliefs_fts WHERE beliefs_fts MATCH ? LIMIT 20',
+      ).all(ftsQuery) as BeliefBM25Row[];
+      for (const row of bm25Rows) {
+        bm25Map.set(row.rowid, row.score);
+      }
+    } catch {
+      // FTS match can fail on unusual input — continue with vector-only
+    }
+  }
+
+  // 2. Load active beliefs with embeddings for vector similarity
+  const activeBeliefs = projectName
+    ? db.prepare(
+        `SELECT *, rowid FROM beliefs WHERE status = 'active' AND embedding IS NOT NULL AND (scope = 'global' OR project = ?)`,
+      ).all(projectName) as (Belief & { rowid: number })[]
+    : db.prepare(
+        `SELECT *, rowid FROM beliefs WHERE status = 'active' AND embedding IS NOT NULL`,
+      ).all() as (Belief & { rowid: number })[];
+
+  if (activeBeliefs.length === 0) return [];
+
+  // 3. Score beliefs using additive formula
+  interface ScoredBelief {
+    belief: Belief & { rowid: number };
+    score: number;
+  }
+
+  // Normalize BM25 scores for beliefs
+  const bm25Scores = Array.from(bm25Map.values());
+  const bm25Min = bm25Scores.length > 0 ? Math.min(...bm25Scores) : 0;
+  const bm25Max = bm25Scores.length > 0 ? Math.max(...bm25Scores) : 0;
+
+  const scored: ScoredBelief[] = [];
+  for (const belief of activeBeliefs) {
+    const confidence = beliefConfidence(belief.confidence_alpha, belief.confidence_beta);
+
+    // Filter: confidence must exceed minimum for recall
+    if (confidence <= BELIEF_CONFIG.MIN_CONFIDENCE_FOR_RECALL) continue;
+
+    // Vector similarity
+    const vectorSim = cosineSimilarity(queryBlob, belief.embedding as Buffer);
+
+    // Retrieval strength (dual-strength decay)
+    const retStrength = retrievalStrength(belief.last_accessed_at, belief.stability, now);
+
+    // Normalized BM25 score
+    let bm25Score = 0;
+    const rawBm25 = bm25Map.get(belief.rowid);
+    if (rawBm25 !== undefined) {
+      if (bm25Min === bm25Max) {
+        bm25Score = 0.5;
+      } else {
+        bm25Score = (rawBm25 - bm25Max) / (bm25Min - bm25Max);
+      }
+    }
+
+    // Additive formula: score = 0.5 * (confidence * vectorSim) + 0.3 * retrievalStrength + 0.2 * bm25Score
+    const finalScore = 0.5 * (confidence * vectorSim) + 0.3 * retStrength + 0.2 * bm25Score;
+
+    scored.push({ belief, score: finalScore });
+  }
+
+  // Sort by score descending, take top MAX_BELIEF_BITES
+  scored.sort((a, b) => b.score - a.score);
+  const topBeliefs = scored.slice(0, BELIEF_CONFIG.MAX_BELIEF_BITES);
+
+  if (topBeliefs.length === 0) return [];
+
+  // Update last_accessed_at and access_count for surfaced beliefs
+  const updateStmt = db.prepare(
+    'UPDATE beliefs SET last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?',
+  );
+  for (const s of topBeliefs) {
+    updateStmt.run(now, s.belief.id);
+  }
+
+  // Format as belief bites
+  return topBeliefs.map(s => {
+    const confidence = beliefConfidence(s.belief.confidence_alpha, s.belief.confidence_beta);
+    return {
+      id: s.belief.id,
+      bite: `[Belief (${confidence.toFixed(2)}): ${s.belief.statement}]`,
+      date: s.belief.created_at,
+      importance: 'normal',
+      type: 'belief' as const,
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------

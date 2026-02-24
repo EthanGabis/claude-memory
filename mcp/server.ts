@@ -9,7 +9,7 @@ import os from 'node:os';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 
-import { initDb, DB_PATH } from './schema.js';
+import { initDb, DB_PATH, type Belief } from './schema.js';
 import { packEmbedding, cosineSimilarity } from './embeddings.js';
 import { search, type SearchResult } from './search.js';
 import { indexFile, backfillEmbeddings } from './indexer.js';
@@ -19,6 +19,7 @@ import { withFileLock } from '../shared/file-lock.js';
 import { resolveProjectFromCwd } from '../shared/project-resolver.js';
 import { SOCKET_PATH } from '../shared/uds.js';
 import { getProjectFamilyPaths, sqlInPlaceholders } from '../shared/project-family.js';
+import { beliefConfidence, retrievalStrength, updateStability, BELIEF_CONFIG } from '../processor/belief-utils.js';
 
 // ---------------------------------------------------------------------------
 // Startup checks
@@ -171,7 +172,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'memory_recall',
       description:
-        "Get brief memory recollections for a topic. Returns short 'memory bites' that you can expand with memory_expand(). Use this when you want to check what you remember about a topic.",
+        "Get brief memory recollections for a topic. Returns short 'memory bites' and 'belief bites' that you can expand with memory_expand(). Use this when you want to check what you remember about a topic.",
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -195,13 +196,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'memory_expand',
       description:
-        'Expand a memory recollection to get full context. Pass the episode ID from memory_recall results.',
+        'Expand a memory recollection to get full context. Pass the episode or belief ID from memory_recall results.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           id: {
             type: 'string',
-            description: 'The episode ID from memory_recall results (e.g. "ep_abc123")',
+            description: 'The episode ID (e.g. "ep_abc123") or belief ID (e.g. "bl_abc123") from memory_recall results',
           },
         },
         required: ['id'],
@@ -210,13 +211,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'memory_forget',
       description:
-        'Delete a specific memory episode by ID. Use this to remove incorrect or outdated memories.',
+        'Delete a specific memory episode or belief by ID. Use this to remove incorrect or outdated memories.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           id: {
             type: 'string',
-            description: 'Episode ID to delete (from memory_recall results)',
+            description: 'Episode ID (e.g. "ep_abc123") or belief ID (e.g. "bl_abc123") to delete',
           },
         },
         required: ['id'],
@@ -812,22 +813,125 @@ async function handleMemoryRecall(args: {
       updateStmt.run(now, r.episode.id);
     }
 
-    // 6. Format output
-    const formatted = topResults
-      .map((r, i) => {
-        const date = new Date(r.episode.created_at);
-        const monthStr = date.toLocaleString('en-US', { month: 'short' });
-        const dayStr = date.getDate();
-        const importanceTag = r.episode.importance === 'high' ? 'high' : 'normal';
-        return `[${i + 1}] (${monthStr} ${dayStr}, ${importanceTag}) ${r.episode.summary} — ID: ${r.episode.id}`;
-      })
+    // 5b. Belief blending — query beliefs and blend into results
+    interface RecallResult {
+      type: 'episode' | 'belief';
+      score: number;
+      line: string;
+    }
+
+    const recallResults: RecallResult[] = topResults.map((r, i) => {
+      const date = new Date(r.episode.created_at);
+      const monthStr = date.toLocaleString('en-US', { month: 'short' });
+      const dayStr = date.getDate();
+      const importanceTag = r.episode.importance === 'high' ? 'high' : 'normal';
+      return {
+        type: 'episode' as const,
+        score: r.score,
+        line: `(${monthStr} ${dayStr}, ${importanceTag}) ${r.episode.summary} — ID: ${r.episode.id}`,
+      };
+    });
+
+    try {
+      // BM25 on beliefs_fts
+      const beliefBm25Map = new Map<number, number>();
+      if (ftsQuery.length > 0) {
+        try {
+          const beliefBm25Rows = db.prepare(
+            'SELECT rowid, bm25(beliefs_fts) as score FROM beliefs_fts WHERE beliefs_fts MATCH ? LIMIT 20',
+          ).all(ftsQuery) as EpisodeBM25Row[];
+          for (const row of beliefBm25Rows) {
+            beliefBm25Map.set(row.rowid, row.score);
+          }
+        } catch {
+          // FTS match can fail — continue with vector-only
+        }
+      }
+
+      // Load active beliefs with embeddings (filtered by project scope when applicable)
+      const activeBeliefs = (
+        familyPaths.length > 0
+          ? db.prepare(
+              `SELECT *, rowid FROM beliefs WHERE status = 'active' AND embedding IS NOT NULL AND (scope = 'global' OR project_path IN (${sqlInPlaceholders(familyPaths)}))`,
+            ).all(...familyPaths)
+          : db.prepare(
+              `SELECT *, rowid FROM beliefs WHERE status = 'active' AND embedding IS NOT NULL`,
+            ).all()
+      ) as (Belief & { rowid: number })[];
+
+      if (activeBeliefs.length > 0) {
+        // Normalize belief BM25 scores
+        const beliefBm25Scores = Array.from(beliefBm25Map.values());
+        const beliefBm25Min = beliefBm25Scores.length > 0 ? Math.min(...beliefBm25Scores) : 0;
+        const beliefBm25Max = beliefBm25Scores.length > 0 ? Math.max(...beliefBm25Scores) : 0;
+
+        interface ScoredBelief {
+          belief: Belief & { rowid: number };
+          score: number;
+        }
+
+        const scoredBeliefs: ScoredBelief[] = [];
+        for (const belief of activeBeliefs) {
+          const confidence = beliefConfidence(belief.confidence_alpha, belief.confidence_beta);
+          if (confidence <= BELIEF_CONFIG.MIN_CONFIDENCE_FOR_RECALL) continue;
+
+          const vectorSim = cosineSimilarity(queryEmbedding, belief.embedding as Buffer);
+          const retStrength = retrievalStrength(belief.last_accessed_at, belief.stability, now);
+
+          let bm25Score = 0;
+          const rawBm25 = beliefBm25Map.get(belief.rowid);
+          if (rawBm25 !== undefined) {
+            if (beliefBm25Min === beliefBm25Max) {
+              bm25Score = 0.5;
+            } else {
+              bm25Score = (rawBm25 - beliefBm25Max) / (beliefBm25Min - beliefBm25Max);
+            }
+          }
+
+          const finalScore = 0.5 * (confidence * vectorSim) + 0.3 * retStrength + 0.2 * bm25Score;
+          scoredBeliefs.push({ belief, score: finalScore });
+        }
+
+        scoredBeliefs.sort((a, b) => b.score - a.score);
+        const topBeliefs = scoredBeliefs.slice(0, BELIEF_CONFIG.MAX_BELIEF_BITES);
+
+        // Update last_accessed_at and access_count for surfaced beliefs
+        const updateBeliefStmt = db.prepare(
+          'UPDATE beliefs SET last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?',
+        );
+        for (const s of topBeliefs) {
+          updateBeliefStmt.run(now, s.belief.id);
+
+          const confidence = beliefConfidence(s.belief.confidence_alpha, s.belief.confidence_beta);
+          const date = new Date(s.belief.created_at);
+          const monthStr = date.toLocaleString('en-US', { month: 'short' });
+          const dayStr = date.getDate();
+
+          recallResults.push({
+            type: 'belief',
+            score: s.score,
+            line: `[B] (${monthStr} ${dayStr}, confidence: ${confidence.toFixed(2)}) ${s.belief.statement} — ID: ${s.belief.id}`,
+          });
+        }
+      }
+    } catch (err) {
+      console.error(`[memory_recall] Belief blending failed: ${(err as Error).message}`);
+      // Non-fatal — continue with episode-only results
+    }
+
+    // 6. Sort blended results by score so beliefs interleave with episodes by relevance
+    recallResults.sort((a, b) => b.score - a.score);
+
+    // Format output — number all results sequentially
+    const formatted = recallResults
+      .map((r, i) => `[${i + 1}] ${r.line}`)
       .join('\n');
 
     return {
       content: [
         {
           type: 'text' as const,
-          text: topResults.length > 0
+          text: recallResults.length > 0
             ? formatted
             : 'No memories found for that topic.',
         },
@@ -854,6 +958,11 @@ async function handleMemoryExpand(args: { id: string }) {
   const { id } = args;
 
   try {
+    // Handle belief IDs
+    if (id.startsWith('bl_')) {
+      return handleBeliefExpand(id);
+    }
+
     const episode = db
       .prepare('SELECT * FROM episodes WHERE id = ?')
       .get(id) as EpisodeRow | undefined;
@@ -932,6 +1041,92 @@ async function handleMemoryExpand(args: { id: string }) {
   }
 }
 
+function handleBeliefExpand(id: string) {
+  const belief = db
+    .prepare('SELECT * FROM beliefs WHERE id = ?')
+    .get(id) as Belief | undefined;
+
+  if (!belief) {
+    return {
+      content: [{ type: 'text' as const, text: 'No belief found with that ID.' }],
+    };
+  }
+
+  const now = Date.now();
+
+  // Update stability using spaced repetition before updating last_accessed_at
+  const newStability = updateStability(belief.stability, belief.last_accessed_at, now);
+
+  // Increment access_count, update last_accessed_at and stability
+  db.prepare(
+    'UPDATE beliefs SET last_accessed_at = ?, access_count = access_count + 1, stability = ? WHERE id = ?',
+  ).run(now, newStability, id);
+
+  // Format confidence
+  const confidence = beliefConfidence(belief.confidence_alpha, belief.confidence_beta);
+
+  // Format dates
+  const createdDate = new Date(belief.created_at).toLocaleDateString('en-US', {
+    month: 'short', day: 'numeric', year: 'numeric',
+  });
+  const updatedDate = new Date(belief.updated_at).toLocaleDateString('en-US', {
+    month: 'short', day: 'numeric', year: 'numeric',
+  });
+
+  // Parse JSON arrays
+  let supportingEps: string[] = [];
+  let contradictingEps: string[] = [];
+  let revisionHistory: any[] = [];
+  let childBeliefIds: string[] = [];
+
+  try { supportingEps = JSON.parse(belief.supporting_episodes); } catch {}
+  try { contradictingEps = JSON.parse(belief.contradicting_episodes); } catch {}
+  try { revisionHistory = JSON.parse(belief.revision_history); } catch {}
+  try { childBeliefIds = JSON.parse(belief.child_belief_ids); } catch {}
+
+  // Format revision history
+  let revisionStr = 'None';
+  if (revisionHistory.length > 0) {
+    revisionStr = revisionHistory.map((r: any) => {
+      const date = new Date(r.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      return `  - ${date}: "${r.old_statement}" (confidence: ${r.old_confidence?.toFixed(2) ?? '?'}) — ${r.reason}`;
+    }).join('\n');
+  }
+
+  // Build output
+  const outputLines = [
+    `## Belief: ${belief.statement}`,
+    '',
+    `**Subject:** ${belief.subject || '(none)'}`,
+    `**Predicate:** ${belief.predicate || '(none)'}`,
+    `**Context:** ${belief.context || '(general)'}`,
+    `**Timeframe:** ${belief.timeframe || 'current'}`,
+    '',
+    `**Confidence:** ${confidence.toFixed(3)} (alpha=${belief.confidence_alpha}, beta=${belief.confidence_beta})`,
+    `**Status:** ${belief.status}`,
+    `**Evidence Count:** ${belief.evidence_count}`,
+    `**Scope:** ${belief.scope}${belief.project ? ` (${belief.project})` : ''}`,
+    '',
+    `**Created:** ${createdDate}`,
+    `**Updated:** ${updatedDate}`,
+    `**Stability:** ${newStability.toFixed(2)} days`,
+    `**Access Count:** ${belief.access_count + 1}`,
+    '',
+    `**Supporting Episodes:** ${supportingEps.length > 0 ? supportingEps.join(', ') : 'None'}`,
+    `**Contradicting Episodes:** ${contradictingEps.length > 0 ? contradictingEps.join(', ') : 'None'}`,
+    '',
+    `**Revision History:**`,
+    revisionStr,
+    '',
+    `**Parent Belief:** ${belief.parent_belief_id || 'None'}`,
+    `**Child Beliefs:** ${childBeliefIds.length > 0 ? childBeliefIds.join(', ') : 'None'}`,
+  ];
+
+  return {
+    content: [{ type: 'text' as const, text: outputLines.join('\n') }],
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tool: memory_forget
 // ---------------------------------------------------------------------------
@@ -940,20 +1135,40 @@ async function handleMemoryForget(args: { id: string }) {
   const { id } = args;
 
   try {
-    // Validate ID format
-    if (!id || !id.startsWith('ep_')) {
+    // Validate ID format — accept both ep_* and bl_* prefixes
+    if (!id || (!id.startsWith('ep_') && !id.startsWith('bl_'))) {
       return {
         content: [
           {
             type: 'text' as const,
-            text: 'Invalid episode ID. Must start with "ep_" (e.g. "ep_abc123").',
+            text: 'Invalid ID. Must start with "ep_" (episode) or "bl_" (belief).',
           },
         ],
         isError: true,
       };
     }
 
-    // Check episode exists
+    // Handle belief deletion
+    if (id.startsWith('bl_')) {
+      const belief = db
+        .prepare('SELECT id, statement FROM beliefs WHERE id = ?')
+        .get(id) as { id: string; statement: string } | undefined;
+
+      if (!belief) {
+        return {
+          content: [{ type: 'text' as const, text: `No belief found with ID: ${id}` }],
+        };
+      }
+
+      // Delete from beliefs table — triggers handle FTS cleanup
+      db.prepare('DELETE FROM beliefs WHERE id = ?').run(id);
+
+      return {
+        content: [{ type: 'text' as const, text: `Deleted belief: "${belief.statement}" (${id})` }],
+      };
+    }
+
+    // Handle episode deletion (existing logic)
     const episode = db
       .prepare('SELECT id, summary, scope, project, project_path FROM episodes WHERE id = ?')
       .get(id) as { id: string; summary: string; scope: string; project: string | null; project_path: string | null } | undefined;
@@ -1126,6 +1341,18 @@ async function handleMemoryStatus() {
       FROM episodes GROUP BY importance ORDER BY cnt DESC
     `).all() as { importance: string; cnt: number }[];
 
+    // 2b. Belief counts
+    let beliefTotal = 0;
+    let beliefActive = 0;
+    try {
+      const beliefTotalRow = db.prepare('SELECT COUNT(*) as cnt FROM beliefs').get() as { cnt: number };
+      beliefTotal = beliefTotalRow.cnt;
+      const beliefActiveRow = db.prepare("SELECT COUNT(*) as cnt FROM beliefs WHERE status = 'active'").get() as { cnt: number };
+      beliefActive = beliefActiveRow.cnt;
+    } catch {
+      // beliefs table may not exist yet on older schemas
+    }
+
     // 3. Chunk count
     const chunkRow = db.prepare('SELECT COUNT(*) as cnt FROM chunks').get() as { cnt: number };
     const chunkCount = chunkRow.cnt;
@@ -1175,6 +1402,7 @@ async function handleMemoryStatus() {
       }
     }
     lines.push('');
+    lines.push(`Beliefs:      ${beliefActive} active / ${beliefTotal} total`);
     lines.push(`Chunks:       ${chunkCount}`);
     lines.push(`Recollections: ${recollectionCount} active`);
 

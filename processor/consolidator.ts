@@ -2,7 +2,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import type { Database } from 'bun:sqlite';
+import type OpenAI from 'openai';
 import { withFileLock } from '../shared/file-lock.js';
+import { runBeliefConsolidation } from './belief-consolidator.js';
 
 const GLOBAL_MEMORY_PATH = path.join(os.homedir(), '.claude-memory', 'MEMORY.md');
 const GRADUATION_MIN_ACCESS = 3;
@@ -31,12 +33,26 @@ interface CompressCandidate {
   accessed_at: number;
 }
 
-export async function runConsolidation(db: Database): Promise<{
+export async function runConsolidation(
+  db: Database,
+  openai?: OpenAI | null,
+  embedProvider?: { embed(texts: string[]): Promise<(Float32Array | null)[]> } | null,
+): Promise<{
   graduated: number;
   compressed: number;
 }> {
   const graduated = await graduateEpisodes(db);
   const compressed = await compressStaleEpisodes(db);
+
+  // Run belief consolidation if LLM client and embed provider are available
+  if (openai && embedProvider) {
+    try {
+      await runBeliefConsolidation(db, openai, embedProvider);
+    } catch (err) {
+      console.error(`[consolidator] Belief consolidation failed: ${(err as Error).message}`);
+    }
+  }
+
   return { graduated, compressed };
 }
 

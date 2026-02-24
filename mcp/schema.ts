@@ -500,7 +500,133 @@ export function initDb(dbPath: string): Database {
     }
   }
 
+  // --- Schema version 9 migration: beliefs table ---
+  const v9Row = db.query<{ value: string }, []>(
+    `SELECT value FROM _meta WHERE key = 'schema_version'`
+  ).get();
+  const v9Version = v9Row ? parseInt(v9Row.value, 10) : 1;
+
+  if (v9Version < 9) {
+    const runV9Migration = () => {
+      db.exec(`BEGIN EXCLUSIVE`);
+      try {
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS beliefs (
+            id                     TEXT PRIMARY KEY,
+            statement              TEXT NOT NULL,
+            subject                TEXT,
+            predicate              TEXT,
+            context                TEXT,
+            timeframe              TEXT,
+            confidence_alpha       REAL NOT NULL DEFAULT 1,
+            confidence_beta        REAL NOT NULL DEFAULT 1,
+            scope                  TEXT NOT NULL DEFAULT 'global',
+            project                TEXT,
+            project_path           TEXT,
+            supporting_episodes    TEXT NOT NULL DEFAULT '[]',
+            contradicting_episodes TEXT NOT NULL DEFAULT '[]',
+            revision_history       TEXT NOT NULL DEFAULT '[]',
+            -- INVARIANT: parent_belief_id forms a tree; cycles are forbidden
+            parent_belief_id       TEXT,
+            child_belief_ids       TEXT NOT NULL DEFAULT '[]',
+            embedding              BLOB,
+            status                 TEXT NOT NULL DEFAULT 'active',
+            evidence_count         INTEGER NOT NULL DEFAULT 0,
+            stability              REAL NOT NULL DEFAULT 1.0,
+            created_at             INTEGER NOT NULL,
+            updated_at             INTEGER NOT NULL,
+            last_reinforced_at     INTEGER,
+            last_accessed_at       INTEGER,
+            access_count           INTEGER NOT NULL DEFAULT 0
+          );
+
+          CREATE VIRTUAL TABLE IF NOT EXISTS beliefs_fts USING fts5(
+            statement, subject, predicate, context,
+            content='beliefs',
+            content_rowid='rowid'
+          );
+
+          CREATE TRIGGER IF NOT EXISTS beliefs_ai AFTER INSERT ON beliefs BEGIN
+            INSERT INTO beliefs_fts(rowid, statement, subject, predicate, context)
+            VALUES (new.rowid, new.statement, COALESCE(new.subject, ''), COALESCE(new.predicate, ''), COALESCE(new.context, ''));
+          END;
+
+          CREATE TRIGGER IF NOT EXISTS beliefs_ad AFTER DELETE ON beliefs BEGIN
+            INSERT INTO beliefs_fts(beliefs_fts, rowid, statement, subject, predicate, context)
+            VALUES ('delete', old.rowid, old.statement, COALESCE(old.subject, ''), COALESCE(old.predicate, ''), COALESCE(old.context, ''));
+          END;
+
+          CREATE TRIGGER IF NOT EXISTS beliefs_au AFTER UPDATE ON beliefs BEGIN
+            INSERT INTO beliefs_fts(beliefs_fts, rowid, statement, subject, predicate, context)
+            VALUES ('delete', old.rowid, old.statement, COALESCE(old.subject, ''), COALESCE(old.predicate, ''), COALESCE(old.context, ''));
+            INSERT INTO beliefs_fts(rowid, statement, subject, predicate, context)
+            VALUES (new.rowid, new.statement, COALESCE(new.subject, ''), COALESCE(new.predicate, ''), COALESCE(new.context, ''));
+          END;
+
+          CREATE INDEX IF NOT EXISTS idx_beliefs_status ON beliefs(status);
+          CREATE INDEX IF NOT EXISTS idx_beliefs_scope ON beliefs(scope);
+          CREATE INDEX IF NOT EXISTS idx_beliefs_project_path ON beliefs(project_path);
+
+          INSERT OR IGNORE INTO _meta (key, value) VALUES ('belief_consolidation_checkpoint', '0');
+
+          UPDATE _meta SET value = '9' WHERE key = 'schema_version';
+        `);
+        db.exec(`COMMIT`);
+      } catch (err) {
+        try { db.exec(`ROLLBACK`); } catch {}
+        throw err;
+      }
+    };
+
+    try {
+      runV9Migration();
+    } catch (err) {
+      if ((err as Error).message?.includes('SQLITE_BUSY') || (err as Error).message?.includes('database is locked')) {
+        console.error('[schema] v9 migration busy — retrying in 6s');
+        Bun.sleepSync(6000);
+        const recheck = db.query<{ value: string }, []>(
+          `SELECT value FROM _meta WHERE key = 'schema_version'`
+        ).get();
+        if (recheck && parseInt(recheck.value, 10) >= 9) {
+          console.error('[schema] v9 migration completed by other process');
+        } else {
+          runV9Migration();
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
   return db;
+}
+
+export interface Belief {
+  id: string;
+  statement: string;
+  subject: string | null;
+  predicate: string | null;
+  context: string | null;
+  timeframe: string | null;
+  confidence_alpha: number;
+  confidence_beta: number;
+  scope: string;
+  project: string | null;
+  project_path: string | null;
+  supporting_episodes: string;
+  contradicting_episodes: string;
+  revision_history: string;
+  parent_belief_id: string | null;
+  child_belief_ids: string;
+  embedding: Buffer | null;
+  status: string;
+  evidence_count: number;
+  stability: number;
+  created_at: number;
+  updated_at: number;
+  last_reinforced_at: number | null;
+  last_accessed_at: number | null;
+  access_count: number;
 }
 
 export const DB_PATH = path.join(

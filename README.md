@@ -96,9 +96,9 @@ The daemon starts on login and restarts on crash. Logs go to `~/.claude-memory/e
 | `memory_search(query, limit?, project?)` | Hybrid BM25 + vector search with temporal decay (30-day half-life). Returns ranked results with file path, line range, score, and snippet. |
 | `memory_get(path, startLine?, lineCount?)` | Read a specific memory file by workspace-relative path. 10K char cap. |
 | `memory_save(content, target?, cwd?)` | Save to daily log (`target="log"`, default) or MEMORY.md (`target="memory"`, with dedup). |
-| `memory_recall(query, limit?, project?)` | Get short "memory bites" from the episodes table. Scored by relevance, recency, and access frequency. |
-| `memory_expand(id)` | Expand an episode ID from `memory_recall` to get full context, entities, and metadata. |
-| `memory_forget(id)` | Delete a specific memory episode by ID. Use to remove incorrect or outdated memories. |
+| `memory_recall(query, limit?, project?)` | Get short "memory bites" from the episodes table blended with "belief bites" from the beliefs table. Scored by relevance, recency, and access frequency. |
+| `memory_expand(id)` | Expand an episode (`ep_*`) or belief (`bl_*`) ID to get full context. For beliefs: statement, structured fields, confidence (alpha/beta), evidence chains, revision history, and parent/child links. |
+| `memory_forget(id)` | Delete a specific episode (`ep_*`) or belief (`bl_*`) by ID. Use to remove incorrect or outdated memories. |
 | `memory_status()` | Check Engram daemon health, episode counts, schema version, and system status. |
 
 ## Hooks
@@ -119,7 +119,7 @@ The Engram processor (`bun processor/index.ts`) is a long-running daemon that:
 - **Memory extraction** -- After the first 5 messages (then every 15 messages or 20 minutes), sends the conversation buffer to `gpt-4.1-nano` to extract episodic memories (summary, full context, entities, importance, scope). Deduplicates against existing episodes via cosine similarity (>0.92 threshold = append-update instead of insert). Retries with exponential backoff (15s-120s) on failure.
 - **Recollection writing** -- On each user message, embeds it locally (~5ms via nomic-embed-text GGUF), checks for topic change (cosine sim < 0.85 with previous message), and writes the top 3 relevant memory bites to `~/.claude-memory/recollections/<sessionId>.json` for the PreToolUse hook to pick up. Scoring uses Laplace-smoothed access frequency and a high-importance relevance floor.
 - **Hook-daemon communication** -- UDS socket at `~/.claude-memory/engram.sock` accepts flush signals from the stop hook so buffered messages are extracted before session JSONL goes stale.
-- **Consolidation** -- Every 4 hours: graduates high-importance, frequently-accessed episodes (or those older than 14 days) to global MEMORY.md, and compresses stale low-access episodes by dropping `full_content`. MEMORY.md is capped at 200 lines with overflow archived to monthly files.
+- **Consolidation** -- Every 4 hours: graduates high-importance, frequently-accessed episodes (or those older than 14 days) to global MEMORY.md, compresses stale low-access episodes by dropping `full_content`, and runs **belief consolidation** -- clustering recent episodes by embedding similarity, synthesizing generalized beliefs via `gpt-4.1-mini`, and updating existing beliefs through reinforcement, contradiction, revision, split, merge, and archival. MEMORY.md is capped at 200 lines with overflow archived to monthly files.
 
 Singleton enforcement via PID file (`~/.claude-memory/engram.pid`). Memory-limited to 512MB RSS with automatic restart.
 
@@ -153,6 +153,50 @@ Internal constants (edit in source):
 | Episode similarity dedup | 0.92 | `processor/extractor.ts` |
 | Memory RSS limit | 512 MB | `processor/index.ts` |
 | Temporal decay half-life | 30 days | `mcp/search.ts` |
+| Belief consolidation episode threshold | 20 | `processor/belief-utils.ts` |
+| Min cluster size for belief | 3 | `processor/belief-utils.ts` |
+| Belief reinforce cosine threshold | 0.92 | `processor/belief-utils.ts` |
+| Min confidence for recall | 0.4 | `processor/belief-utils.ts` |
+| Max belief bites per recall | 2 | `processor/belief-utils.ts` |
+| Consolidation cycle budget | 120s | `processor/belief-utils.ts` |
+
+## Evaluation Harness
+
+Offline IR evaluation for measuring and optimizing retrieval quality. Lives in `eval/`.
+
+```bash
+# Build dataset from production episodes (requires ANTHROPIC_API_KEY)
+bun run eval/run.ts dataset
+
+# Run parameter ablation (e.g., sweep BM25 weight)
+bun run eval/run.ts ablation --sweep wBm25
+
+# Compare RRF vs legacy retriever
+bun run eval/run.ts ablation --baseline
+
+# Latency benchmark
+bun run eval/run.ts benchmark
+
+# View results table
+bun run eval/run.ts report
+```
+
+Sweep parameters: `wBm25`, `wRecency`, `wAccess`, `minVectorSim`, `k`, or `all`. Results are saved as JSONL in `eval/results/`.
+
+See [docs/features/2026-02-24-eval-harness.md](docs/features/2026-02-24-eval-harness.md) for full documentation.
+
+## Belief System (Semantic Memory)
+
+Engram includes a semantic memory layer that extracts generalized beliefs from episodic memory using a neuroscience-grounded consolidation pipeline. Beliefs are living hypotheses with Bayesian confidence tracking (Beta-Bernoulli distribution) that strengthen with reinforcement and weaken with contradictions. They follow a full lifecycle: creation from episode clusters, reinforcement, contradiction, revision, split, merge, decay, and archival. Beliefs are surfaced as "belief bites" alongside episode "memory bites" in `memory_recall` and pre-computed recollections.
+
+Key design properties:
+- **Complementary Learning Systems**: episodes (hippocampus) + beliefs (neocortex) with batch consolidation
+- **Beta-Bernoulli confidence**: `confidence = alpha / (alpha + beta)`, naturally resistant to change with accumulated evidence
+- **Dual-strength model**: storage strength (evidence_count, monotonic) + retrieval strength (exponential decay with spaced-repetition stability bonus)
+- **Rule-based gates**: split, merge, revision, and archival are gated by deterministic thresholds, not LLM decisions
+- **Materialized views**: beliefs are derived from episodes and can be rebuilt from scratch
+
+See [docs/features/2026-02-24-belief-system.md](docs/features/2026-02-24-belief-system.md) for full documentation.
 
 ## Architecture
 
@@ -188,7 +232,7 @@ Claude Code Session
   |
   v
 ~/.claude-memory/
-  ├── memory.db          (SQLite: chunks FTS5 + episodes + embeddings)
+  ├── memory.db          (SQLite: chunks FTS5 + episodes + beliefs + embeddings)
   ├── MEMORY.md          (global durable facts, 200-line cap)
   ├── engram.pid         (daemon singleton lock)
   ├── engram.sock        (UDS socket for hook-daemon communication)

@@ -280,8 +280,51 @@ function startTailer(jsonlPath: string): void {
 let embedProvider: LocalGGUFProvider;
 
 /**
+ * Keyword rules for content-based project inference from episode summaries.
+ * Each entry maps a project name to a list of case-insensitive keywords/phrases.
+ * Checked against episode summary text to override session-level majority vote.
+ */
+const PROJECT_KEYWORD_RULES: { project: string; projectPath: string; keywords: RegExp }[] = [
+  {
+    project: 'TrueTTS',
+    projectPath: '/Users/ethangabis/Desktop/Projects/TTS/TrueTTS',
+    keywords: /\b(truetts|voice\s+clone|voice\s+generation|text[\s-]to[\s-]speech|tts\b(?!\s*project)|speech\s+synth|audio\s+generat|kokoro|piper|elevenlabs|playht)/i,
+  },
+  {
+    project: 'claude-memory',
+    projectPath: '/Users/ethangabis/Desktop/Projects/claude-memory',
+    keywords: /\b(engram|memory\s+system|memory\s+daemon|episode[s]?\b(?!.*tv|.*show|.*series)|recollection|consolidat|belief[s]?\s+(system|store|updat)|mcp\s+server|mcp\s+tool|memory_save|memory_search|memory_recall|session[\s-]?tailer|embed\s+provider)/i,
+  },
+  {
+    project: 'MM',
+    projectPath: '/Users/ethangabis/Desktop/Projects/MM',
+    keywords: /\b(matchmaker|MM\b(?!\s))/i,
+  },
+];
+
+/**
+ * Infer project for a single episode based on its summary text.
+ * Returns the project name if a keyword rule matches, or null to use session default.
+ */
+function inferProjectFromSummary(summary: string): { project: string; projectPath: string } | null {
+  for (const rule of PROJECT_KEYWORD_RULES) {
+    if (rule.keywords.test(summary)) {
+      return { project: rule.project, projectPath: rule.projectPath };
+    }
+  }
+  return null;
+}
+
+/**
  * On startup, re-resolve all global episodes whose sessions might belong to a project.
  * Scans JSONL files for file paths and infers the real project.
+ *
+ * Per-episode refinement: after session-level inference determines a default project,
+ * each episode's summary is checked against keyword rules. If a keyword match points
+ * to a different project, that episode is tagged individually. This prevents sessions
+ * from parent directories (e.g. /Desktop/Projects) from mis-tagging all episodes
+ * with a single majority-vote project.
+ *
  * Runs once per startup -- safe to repeat (idempotent).
  */
 async function runStartupMigration(database: Database, openaiClient: any): Promise<void> {
@@ -317,12 +360,24 @@ async function runStartupMigration(database: Database, openaiClient: any): Promi
     }
   } catch {}
 
-  // Step 3: For each global session, try file-path inference
+  // Step 3: For each global session, try file-path inference + per-episode refinement
   let rescoped = 0;
+  let refined = 0;
   let projectsDiscovered = 0;
 
-  const updateStmt = database.prepare(
-    `UPDATE episodes SET scope = 'project', project = ? WHERE session_id = ? AND scope = 'global'`
+  // Bulk update: tag all global episodes in a session with the session-level project
+  const updateSessionStmt = database.prepare(
+    `UPDATE episodes SET scope = 'project', project = ?, project_path = ? WHERE session_id = ? AND scope = 'global'`
+  );
+
+  // Per-episode update: refine individual episodes whose summary matches a different project
+  const updateEpisodeStmt = database.prepare(
+    `UPDATE episodes SET project = ?, project_path = ? WHERE id = ?`
+  );
+
+  // Fetch global episodes for per-episode refinement
+  const fetchEpisodesStmt = database.prepare(
+    `SELECT id, summary, project FROM episodes WHERE session_id = ? AND scope = 'project'`
   );
 
   // Batch updates in groups of 20 sessions per transaction to avoid holding
@@ -343,9 +398,23 @@ async function runStartupMigration(database: Database, openaiClient: any): Promi
           const inferred = inferProjectFromPaths(filePaths, 0.4);
           if (!inferred || !inferred.name || inferred.isRoot) continue;
 
-          const result = updateStmt.run(inferred.name, session_id);
+          // Phase 1: Bulk-tag all global episodes with the session-level project
+          const result = updateSessionStmt.run(inferred.name, inferred.fullPath ?? null, session_id);
           const changes = (result as any).changes ?? 0;
           rescoped += changes;
+
+          // Phase 2: Per-episode refinement using keyword heuristics on summary text
+          // This corrects episodes that belong to a different project than the session majority
+          if (changes > 0) {
+            const episodes = fetchEpisodesStmt.all(session_id) as { id: string; summary: string; project: string }[];
+            for (const ep of episodes) {
+              const keywordMatch = inferProjectFromSummary(ep.summary);
+              if (keywordMatch && keywordMatch.project !== ep.project) {
+                updateEpisodeStmt.run(keywordMatch.project, keywordMatch.projectPath, ep.id);
+                refined++;
+              }
+            }
+          }
 
           // Upsert into projects table
           if (inferred.fullPath) {
@@ -371,7 +440,7 @@ async function runStartupMigration(database: Database, openaiClient: any): Promi
     }
   }
 
-  console.error(`[engram] Startup migration: ${rescoped} episodes re-scoped, ${projectsDiscovered} projects discovered`);
+  console.error(`[engram] Startup migration: ${rescoped} episodes re-scoped, ${refined} refined by keyword, ${projectsDiscovered} projects discovered`);
 }
 
 /**
@@ -753,7 +822,7 @@ async function main(): Promise<void> {
     if (isConsolidating) return;
     isConsolidating = true;
     try {
-      const result = await runConsolidation(db);
+      const result = await runConsolidation(db, openaiClient, embedProvider);
       console.error(`[engram] Cold consolidation: ${result.graduated} graduated, ${result.compressed} compressed`);
     } catch (err) {
       console.error(`[engram] Cold consolidation failed: ${(err as Error).message}`);
