@@ -825,7 +825,7 @@ async function main(): Promise<void> {
     isConsolidating = true;
     try {
       const result = await runConsolidation(db, openaiClient, embedProvider);
-      console.error(`[engram] Cold consolidation: ${result.graduated} graduated, ${result.compressed} compressed`);
+      console.error(`[engram] Cold consolidation: ${result.graduated} graduated, ${result.compressed} compressed, ${result.promoted} promoted, ${result.demoted} demoted, ${result.removed} removed`);
     } catch (err) {
       console.error(`[engram] Cold consolidation failed: ${(err as Error).message}`);
     } finally {

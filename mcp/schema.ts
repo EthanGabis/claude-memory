@@ -650,6 +650,59 @@ export function initDb(dbPath: string): Database {
     }
   }
 
+  // --- Schema version 11 migration: add promoted_at, demoted_at to beliefs ---
+  const v11Row = db.query<{ value: string }, []>(
+    `SELECT value FROM _meta WHERE key = 'schema_version'`
+  ).get();
+  const v11Version = v11Row ? parseInt(v11Row.value, 10) : 1;
+
+  if (v11Version < 11) {
+    const runV11Migration = () => {
+      db.exec(`BEGIN EXCLUSIVE`);
+      try {
+        db.exec(`ALTER TABLE beliefs ADD COLUMN promoted_at INTEGER DEFAULT NULL`);
+        db.exec(`ALTER TABLE beliefs ADD COLUMN demoted_at INTEGER DEFAULT NULL`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_beliefs_promotion ON beliefs(status, promoted_at)`);
+        db.exec(`UPDATE _meta SET value = '11' WHERE key = 'schema_version'`);
+        db.exec(`COMMIT`);
+      } catch (err) {
+        try { db.exec(`ROLLBACK`); } catch {}
+        if ((err as Error).message?.includes('duplicate column')) {
+          db.exec(`BEGIN EXCLUSIVE`);
+          try {
+            db.exec(`CREATE INDEX IF NOT EXISTS idx_beliefs_promotion ON beliefs(status, promoted_at)`);
+            db.exec(`UPDATE _meta SET value = '11' WHERE key = 'schema_version'`);
+            db.exec(`COMMIT`);
+          } catch (innerErr) {
+            try { db.exec(`ROLLBACK`); } catch {}
+            throw innerErr;
+          }
+        } else {
+          throw err;
+        }
+      }
+    };
+
+    try {
+      runV11Migration();
+    } catch (err) {
+      if ((err as Error).message?.includes('SQLITE_BUSY') || (err as Error).message?.includes('database is locked')) {
+        console.error('[schema] v11 migration busy — retrying in 6s');
+        Bun.sleepSync(6000);
+        const recheck = db.query<{ value: string }, []>(
+          `SELECT value FROM _meta WHERE key = 'schema_version'`
+        ).get();
+        if (recheck && parseInt(recheck.value, 10) >= 11) {
+          console.error('[schema] v11 migration completed by other process');
+        } else {
+          runV11Migration();
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
   return db;
 }
 
@@ -680,6 +733,8 @@ export interface Belief {
   last_accessed_at: number | null;
   access_count: number;
   peak_confidence: number | null;
+  promoted_at: number | null;
+  demoted_at: number | null;
 }
 
 export const DB_PATH = path.join(

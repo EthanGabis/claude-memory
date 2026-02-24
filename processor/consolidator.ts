@@ -5,6 +5,7 @@ import type { Database } from 'bun:sqlite';
 import type OpenAI from 'openai';
 import { withFileLock } from '../shared/file-lock.js';
 import { runBeliefConsolidation } from './belief-consolidator.js';
+import { promoteBeliefs, BEGIN_MARKER, END_MARKER } from './belief-promoter.js';
 
 const GLOBAL_MEMORY_PATH = path.join(os.homedir(), '.claude-memory', 'MEMORY.md');
 const GRADUATION_MIN_ACCESS = 3;
@@ -40,6 +41,9 @@ export async function runConsolidation(
 ): Promise<{
   graduated: number;
   compressed: number;
+  promoted: number;
+  demoted: number;
+  removed: number;
 }> {
   const graduated = await graduateEpisodes(db);
   const compressed = await compressStaleEpisodes(db);
@@ -53,7 +57,18 @@ export async function runConsolidation(
     }
   }
 
-  return { graduated, compressed };
+  // Promote/demote beliefs to MEMORY.md
+  let promoted = 0, demoted = 0, removed = 0;
+  try {
+    const promotionResult = await promoteBeliefs(db);
+    promoted = promotionResult.promoted;
+    demoted = promotionResult.demoted;
+    removed = promotionResult.removed;
+  } catch (err) {
+    console.error(`[consolidator] Belief promotion failed: ${(err as Error).message}`);
+  }
+
+  return { graduated, compressed, promoted, demoted, removed };
 }
 
 async function graduateEpisodes(db: Database): Promise<number> {
@@ -131,7 +146,14 @@ async function graduateEpisodes(db: Database): Promise<number> {
     }
 
     // Size cap: archive oldest sections if MEMORY.md exceeds MAX_MEMORY_LINES
-    const lines = newContent.split('\n');
+    // Strip out the beliefs marker section before counting lines — it has its own budget
+    let contentForCounting = newContent;
+    const beliefBeginIdx = contentForCounting.indexOf(BEGIN_MARKER);
+    const beliefEndIdx = contentForCounting.indexOf(END_MARKER);
+    if (beliefBeginIdx !== -1 && beliefEndIdx !== -1 && beliefEndIdx > beliefBeginIdx) {
+      contentForCounting = contentForCounting.slice(0, beliefBeginIdx) + contentForCounting.slice(beliefEndIdx + END_MARKER.length);
+    }
+    const lines = contentForCounting.split('\n');
     if (lines.length > MAX_MEMORY_LINES) {
       // Split on section boundaries (## headers)
       const sections = newContent.split(/(?=^## )/m);
